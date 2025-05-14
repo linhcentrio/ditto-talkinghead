@@ -1,0 +1,11 @@
+runpod==1.5.1
+torch==2.0.1+cu118
+torchvision==0.15.2+cu118
+tensorrt==8.6.1
+onnxruntime-gpu==1.15.1
+numpy==1.24.3
+librosa==0.10.0
+scipy==1.10.1
+opencv-python==4.7.0.72
+tqdm==4.65.0
+boto3==1.26.135
