@@ -10,7 +10,7 @@ cython==3.0.6
 cuda-python==12.2.0
 imageio-ffmpeg==0.4.9
 colored==2.2.0
-polygraphy==0.47.1
+polygraphy
 onnxruntime-gpu==1.16.3
 runpod==1.5.1
 scipy==1.11.4
