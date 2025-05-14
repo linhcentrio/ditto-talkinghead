@@ -9,8 +9,12 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxext6 \
     git \
+    git-lfs \
     wget \
     && rm -rf /var/lib/apt/lists/*
+
+# Thiết lập Git LFS
+RUN git lfs install
 
 # Thiết lập môi trường Python
 RUN ln -s /usr/bin/python3.10 /usr/bin/python
@@ -21,10 +25,12 @@ WORKDIR /app
 COPY . .
 RUN pip install -r requirements.txt --no-cache-dir
 
-# Tải pretrained models
-RUN wget https://github.com/antgroup/ditto-talkinghead/releases/download/v0.4/ditto_trt_Ampere_Plus.zip -P ./checkpoints/ \
-    && unzip ./checkpoints/ditto_trt_Ampere_Plus.zip -d ./checkpoints/ \
-    && rm ./checkpoints/ditto_trt_Ampere_Plus.zip
+# Tải pretrained models từ Hugging Face
+RUN mkdir -p checkpoints && \
+    cd checkpoints && \
+    git clone https://huggingface.co/digital-avatar/ditto-talkinghead && \
+    mv ditto-talkinghead/* . && \
+    rm -rf ditto-talkinghead .git
 
 EXPOSE 8000
 CMD ["python", "-u", "/app/rp_handler.py"]
