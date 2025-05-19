@@ -26,7 +26,8 @@ RUN pip install --no-cache-dir \
     typing_extensions --upgrade \
     runpod \
     filetype \
-    Pillow
+    Pillow \
+    requests
 
 # --- Clone mã nguồn dự án ---
 # Clone mã nguồn từ GitHub vào thư mục làm việc /app
