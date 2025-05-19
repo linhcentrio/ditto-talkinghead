@@ -1,45 +1,56 @@
-FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
+# Sử dụng ảnh nền NVIDIA TensorRT với Python 3
+FROM nvcr.io/nvidia/tensorrt:23.12-py3
 
-# Cài đặt các thư viện hệ thống
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    ffmpeg \
-    libsm6 \
-    libxext6 \
-    libgl1 \
-    libglib2.0-0 \
-    libxrender-dev \
-    libopenblas-dev \
-    ninja-build \
-    git \
-    git-lfs \
-    wget \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Thiết lập Git LFS
-RUN git lfs install
-
-# Thiết lập python
-RUN ln -s /usr/bin/python3.10 /usr/bin/python
-RUN python -m pip install --upgrade pip
-
-# Cài đặt PyTorch và torchvision phù hợp CUDA 11.8
-RUN pip install torch==2.2.2+cu118 torchvision==0.17.2+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
-
-# Copy code vào container
+# Thiết lập thư mục làm việc ban đầu cho ứng dụng bên trong container
 WORKDIR /app
-COPY . .
 
-# Cài đặt các requirements còn lại
-RUN pip install -r requirements.txt --no-cache-dir
+# --- Cài đặt các gói hệ thống cần cho build và runtime ---
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ffmpeg libsndfile1 build-essential python3-dev git-lfs && \
+    rm -rf /var/lib/apt/lists/*
 
-# Clone checkpoints từ HuggingFace (dùng Git LFS)
-RUN mkdir -p checkpoints && \
-    cd checkpoints && \
-    git clone https://huggingface.co/digital-avatar/ditto-talkinghead . && \
-    rm -rf .git
+# --- Cài đặt các gói Python ---
+RUN pip install --no-cache-dir \
+    torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 \
+    && pip install --no-cache-dir \
+    cuda-python \
+    librosa \
+    tqdm \
+    imageio \
+    opencv-python-headless \
+    scikit-image \
+    cython \
+    imageio-ffmpeg \
+    colored \
+    numpy==2.0.1 \
+    typing_extensions --upgrade \
+    runpod \
+    filetype \
+    Pillow
 
-EXPOSE 8000
-CMD ["python", "-u", "/app/rp_handler.py"]
+# --- Clone mã nguồn dự án ---
+# Clone mã nguồn từ GitHub vào thư mục làm việc /app
+RUN git clone https://github.com/antgroup/ditto-talkinghead .
+
+# --- Biên dịch Cython Extensions ---
+RUN cd core/utils/blend && \
+    cython blend.pyx && \
+    gcc -shared -pthread -fPIC -fwrapv -O2 -Wall -fno-strict-aliasing \
+      -I$(python3 -c "import sysconfig; print(sysconfig.get_paths()['include'])") \
+      -I$(python3 -c "import numpy; print(numpy.get_include())") \
+      blend.c -o blend_impl.so
+
+# --- Thiết lập Python Path ---
+ENV PYTHONPATH=/app
+
+# --- Copy Script Handler ---
+COPY rp_handler.py /app/rp_handler.py
+
+# --- Clone Checkpoints (Mô hình) ---
+RUN git clone https://huggingface.co/digital-avatar/ditto-talkinghead /app/checkpoints
+
+# --- Cấu hình lệnh chạy khi container bắt đầu ---
+CMD ["python", "rp_handler.py"]
+
+# --- Optional: Tạo thư mục tạm cho Input/Output ---
+# RUN mkdir -p /tmp/input /tmp/output && chmod -R 777 /tmp/input /tmp/output
