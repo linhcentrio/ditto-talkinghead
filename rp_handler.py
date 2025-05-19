@@ -67,8 +67,6 @@ def download_file(url, destination_path):
         return False
 
 
-# Hàm extract_best_frame không được sử dụng trong handler mới này.
-
 # --- RunPod Handler ---
 
 def handler(event):
