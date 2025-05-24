@@ -16,3 +16,6 @@ runpod==1.5.1
 scipy
 requests
 numpy==2.0.1
+# MinIO dependency mới
+minio==7.2.0
+urllib3==1.26.18
