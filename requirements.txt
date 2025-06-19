@@ -1,0 +1,37 @@
+# AI Core Libraries
+torch>=2.0.0
+tensorrt==8.6.1
+numpy==2.0.1
+librosa
+tqdm
+filetype
+imageio
+imageio-ffmpeg
+opencv-python-headless
+scikit-image
+cython
+cuda-python
+colored
+polygraphy
+
+# UI & Web Framework
+streamlit
+fastapi
+uvicorn
+python-multipart
+requests
+gradio
+
+# Task Queue
+celery
+redis
+
+# Video & Audio Processing
+moviepy
+pysrt
+pillow
+
+# TTS & Audio Services
+openai
+edge-tts
+python-dotenv
