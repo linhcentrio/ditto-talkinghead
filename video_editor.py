@@ -22,42 +22,6 @@ class VideoEditor:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
 
-    def create_sample_audio_if_missing(self, audio_path: Union[str, Path]) -> bool:
-        """Tạo audio mẫu nếu không có audio input"""
-        try:
-            audio_path = Path(audio_path)
-            
-            # Tạo audio im lặng 5 giây
-            cmd = [
-                "ffmpeg", "-y", "-f", "lavfi", 
-                "-i", "anullsrc=r=44100:cl=mono", 
-                "-t", "5", "-q:a", "0", 
-                "-map", "0", str(audio_path)
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True)
-            return result.returncode == 0 and audio_path.exists()
-            
-        except Exception as e:
-            print(f"Lỗi tạo audio mẫu: {e}")
-            return False
-    
-    def fix_audio_format(self, input_audio: Union[str, Path], output_audio: Union[str, Path]) -> bool:
-        """Sửa format audio để đảm bảo tương thích"""
-        try:
-            cmd = [
-                "ffmpeg", "-y", "-i", str(input_audio),
-                "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-                str(output_audio)
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True)
-            return result.returncode == 0
-            
-        except Exception as e:
-            print(f"Lỗi fix audio format: {e}")
-            return False
-
     def generate_audio_from_text(self, text: str, output_path: Union[str, Path], 
                                srt_path: Optional[Union[str, Path]] = None, 
                                service: str = "edge", 

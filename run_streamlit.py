@@ -26,13 +26,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from video_editor import VideoEditor
 
-# Nhận API keys từ môi trường
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
-
-if OPENAI_API_KEY is None or PEXELS_API_KEY is None:
-    raise ValueError("OPENAI_API_KEY và PEXELS_API_KEY chưa được thiết lập.")
-
 # Tắt chế độ theo dõi file của Streamlit để tránh lỗi segmentation fault
 os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
 
