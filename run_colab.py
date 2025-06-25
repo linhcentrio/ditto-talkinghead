@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-🎭 Ditto Talking Head - One-Click Setup for Google Colab
+🎭 Ditto Talking Head - One-Click Setup for Google Colab (Secure Version)
 Tự động cài đặt và khởi chạy toàn bộ ứng dụng trong một lần chạy
 """
 
@@ -19,11 +19,6 @@ REPO_URL = "https://github.com/linhcentrio/ditto-talkinghead.git"
 REPO_BRANCH = "colab"
 HUGGINGFACE_CONFIG_URL = "https://huggingface.co/digital-avatar/ditto-talkinghead/resolve/main/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
 GDRIVE_TRT_MODELS = "https://drive.google.com/drive/folders/1-1qnqy0D9ICgRh8iNY_22j9ieNRC0-zf?usp=sharing"
-
-# API Keys - Có thể tùy chỉnh
-DEFAULT_NGROK_TOKEN = "2S0kIhV5egu7pNb3YxfTSaUR8o0_cceaYJhAW44BiDXwmGtY"
-DEFAULT_OPENAI_KEY = "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"
-DEFAULT_PEXELS_KEY = "pL5us7LHvXJkNgIFe1k4Emk7WjEopjPM98Ww4XSXghdYkAzjfeRppQpK"
 
 class DittoSetup:
     def __init__(self):
@@ -235,40 +230,42 @@ class DittoSetup:
             self.log(f"Lỗi test AI Core: {str(e)}", "⚠️")
             return False
     
-    def setup_api_keys(self, ngrok_token=None, openai_key=None, pexels_key=None):
-        """Thiết lập API keys"""
+    def setup_api_keys(self):
+        """Thiết lập API keys từ environment variables"""
         self.log("Thiết lập API keys...")
         
-        # Sử dụng default nếu không cung cấp
-        ngrok_token = ngrok_token or DEFAULT_NGROK_TOKEN
-        openai_key = openai_key or DEFAULT_OPENAI_KEY
-        pexels_key = pexels_key or DEFAULT_PEXELS_KEY
+        # Lấy keys từ environment variables
+        ngrok_token = os.environ.get('NGROK_TOKEN', '').strip()
+        openai_key = os.environ.get('OPENAI_API_KEY', '').strip()
+        pexels_key = os.environ.get('PEXELS_API_KEY', '').strip()
         
-        if not ngrok_token.strip():
-            self.log("Ngrok token không được để trống!", "❌")
+        # Kiểm tra Ngrok token (bắt buộc)
+        if not ngrok_token:
+            self.log("Ngrok token không được tìm thấy trong environment!", "❌")
+            self.log("Vui lòng chạy cell thiết lập API keys trước", "💡")
             return False
             
         # Thiết lập Ngrok
         try:
-            ngrok.set_auth_token(ngrok_token.strip())
+            ngrok.set_auth_token(ngrok_token)
             self.log("Ngrok token đã được cấu hình")
         except Exception as e:
             self.log(f"Lỗi cấu hình Ngrok: {str(e)}", "❌")
             return False
             
-        # Thiết lập OpenAI
-        if openai_key.strip():
-            os.environ['OPENAI_API_KEY'] = openai_key.strip()
+        # Thiết lập OpenAI (tùy chọn)
+        if openai_key:
+            os.environ['OPENAI_API_KEY'] = openai_key
             self.log("OpenAI API key đã được cấu hình")
         else:
-            self.log("OpenAI API key không được cung cấp", "⚠️")
+            self.log("OpenAI API key không có (sẽ dùng Edge TTS)", "ℹ️")
             
-        # Thiết lập Pexels
-        if pexels_key.strip():
-            os.environ['PEXELS_API_KEY'] = pexels_key.strip()
+        # Thiết lập Pexels (tùy chọn)
+        if pexels_key:
+            os.environ['PEXELS_API_KEY'] = pexels_key
             self.log("Pexels API key đã được cấu hình")
         else:
-            self.log("Pexels API key không được cung cấp", "⚠️")
+            self.log("Pexels API key không có (tùy chọn)", "ℹ️")
             
         return True
     
@@ -354,7 +351,7 @@ class DittoSetup:
             self.log(f"Lỗi tạo Ngrok tunnel: {str(e)}", "❌")
             return False
     
-    def run_full_setup(self, ngrok_token=None, openai_key=None, pexels_key=None):
+    def run_full_setup(self):
         """Chạy toàn bộ quá trình setup"""
         self.log("🎭 BẮT ĐẦU DITTO TALKING HEAD SETUP")
         self.log("=" * 60)
@@ -365,7 +362,7 @@ class DittoSetup:
             ("Thiết lập repository", self.setup_repository),
             ("Tải models", self.download_models),
             ("Test AI Core", self.test_ai_core),
-            ("Thiết lập API keys", lambda: self.setup_api_keys(ngrok_token, openai_key, pexels_key)),
+            ("Thiết lập API keys", self.setup_api_keys),
             ("Khởi động Streamlit", self.start_streamlit_server),
             ("Tạo Ngrok tunnel", self.create_ngrok_tunnel),
         ]
@@ -393,19 +390,21 @@ def main():
     print("🎭 Ditto Talking Head - One-Click Setup")
     print("=" * 60)
     
-    # Đọc API keys từ environment hoặc sử dụng default
-    ngrok_token = os.environ.get('NGROK_TOKEN', DEFAULT_NGROK_TOKEN)
-    openai_key = os.environ.get('OPENAI_API_KEY', DEFAULT_OPENAI_KEY)
-    pexels_key = os.environ.get('PEXELS_API_KEY', DEFAULT_PEXELS_KEY)
+    # Kiểm tra API keys đã được thiết lập chưa
+    ngrok_token = os.environ.get('NGROK_TOKEN', '').strip()
+    
+    if not ngrok_token:
+        print("❌ API Keys chưa được thiết lập!")
+        print("💡 Vui lòng chạy cell 'Thiết lập API Keys' trước tiên")
+        print("🔗 Cell đó sẽ hướng dẫn bạn cách lấy và nhập các API keys cần thiết")
+        sys.exit(1)
+    
+    print("✅ API Keys đã được thiết lập, bắt đầu setup...")
     
     # Khởi tạo và chạy setup
     setup = DittoSetup()
     
-    success = setup.run_full_setup(
-        ngrok_token=ngrok_token,
-        openai_key=openai_key, 
-        pexels_key=pexels_key
-    )
+    success = setup.run_full_setup()
     
     if not success:
         print("\n❌ Setup thất bại! Vui lòng kiểm tra logs.")
