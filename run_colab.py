@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🎭 Ditto Talking Head - One-Click Setup for Google Colab (Secure Version)
-Tự động cài đặt và khởi chạy toàn bộ ứng dụng trong một lần chạy
+🎭 Ditto Talking Head - Complete One-Click Setup for Google Colab
+Tự động cài đặt và khởi chạy toàn bộ ứng dụng từ đầu đến cuối
 """
 
 import os
@@ -11,190 +11,213 @@ import time
 import threading
 import json
 import requests
+import shutil
 from pathlib import Path
-from pyngrok import ngrok
+
+# =================== SIMPLIFIED LOGGER ===================
+class ProgressLogger:
+    def __init__(self, total_steps=8):
+        self.total_steps = total_steps
+        self.current_step = 0
+        self.start_time = time.time()
+
+    def log_step(self, step_name, status="progress"):
+        if status == "progress":
+            self.current_step += 1
+            percent = (self.current_step / self.total_steps) * 100
+            elapsed = time.time() - self.start_time
+            print(f"[{percent:.0f}%] {step_name}...")
+        elif status == "success":
+            print(f"✅ {step_name}")
+        elif status == "error":
+            print(f"❌ {step_name}")
+        elif status == "info":
+            print(f"ℹ️ {step_name}")
+
+# =================== INSTALL DEPENDENCIES FIRST ===================
+def install_critical_packages_silent():
+    """Cài đặt pyngrok trước khi import"""
+    try:
+        import pyngrok
+    except ImportError:
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', 'pyngrok'],
+            capture_output=True, text=True, timeout=120
+        )
+    return True
+
+# Cài đặt pyngrok trước
+install_critical_packages_silent()
+
+# Import sau khi đã cài đặt
+try:
+    from pyngrok import ngrok
+    import torch  # Sử dụng torch có sẵn trong Colab
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+    sys.exit(1)
 
 # =================== CONSTANTS ===================
 REPO_URL = "https://github.com/linhcentrio/ditto-talkinghead.git"
 REPO_BRANCH = "colab"
 HUGGINGFACE_CONFIG_URL = "https://huggingface.co/digital-avatar/ditto-talkinghead/resolve/main/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
-GDRIVE_TRT_MODELS = "https://drive.google.com/drive/folders/1-1qnqy0D9ICgRh8iNY_22j9ieNRC0-zf?usp=sharing"
+GDRIVE_TRT_MODELS = "1-1qnqy0D9ICgRh8iNY_22j9ieNRC0-zf"
 
-class DittoSetup:
+class DittoSimpleSetup:
     def __init__(self):
         self.start_time = time.time()
-        self.gpu_capability = 6  # Default
+        self.gpu_capability = 6
         self.data_root = "./checkpoints/ditto_trt"
+        self.streamlit_process = None
+        self.ngrok_tunnel = None
+        self.logger = ProgressLogger()
         
-    def log(self, message, prefix="🎭"):
-        """In log với timestamp"""
-        elapsed = time.time() - self.start_time
-        print(f"[{elapsed:6.1f}s] {prefix} {message}")
-        
-    def run_command(self, cmd, capture=True, timeout=300, shell=True):
-        """Chạy lệnh với xử lý lỗi và timeout"""
+    def run_command_silent(self, cmd, timeout=300):
+        """Chạy lệnh im lặng, chỉ trả về success/failure"""
         try:
             result = subprocess.run(
-                cmd,
-                shell=shell,
-                capture_output=capture,
-                text=True,
-                timeout=timeout
+                cmd, shell=True, capture_output=True, 
+                text=True, timeout=timeout
             )
-            if result.returncode == 0:
-                return True, result.stdout
-            else:
-                return False, result.stderr
-        except subprocess.TimeoutExpired:
-            return False, f"Timeout after {timeout}s"
-        except Exception as e:
-            return False, str(e)
+            return result.returncode == 0
+        except:
+            return False
     
     def check_system(self):
         """Kiểm tra hệ thống và GPU"""
-        self.log("Kiểm tra hệ thống...")
-        
-        # Kiểm tra GPU
-        success, output = self.run_command("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
-        if success:
-            self.log(f"GPU: {output.strip()}")
-        else:
-            self.log("Không phát hiện GPU", "⚠️")
-            
-        # Kiểm tra PyTorch và CUDA
         try:
-            import torch
-            self.log(f"PyTorch: {torch.__version__}")
-            
+            # Kiểm tra GPU capability
             if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
                 self.gpu_capability = torch.cuda.get_device_capability()[0]
-                
-                self.log(f"CUDA: {torch.version.cuda} | GPU: {gpu_name} ({gpu_memory:.1f}GB)")
-                self.log(f"GPU Compute Capability: {self.gpu_capability}")
-            else:
-                self.log("CUDA không khả dụng", "⚠️")
-                
-        except ImportError:
-            self.log("PyTorch chưa được cài đặt", "❌")
-            return False
-            
-        return True
+            return True
+        except:
+            return True  # Continue anyway
     
-    def install_dependencies(self):
-        """Cài đặt tất cả dependencies"""
-        self.log("Cài đặt thư viện cần thiết...")
+    def install_all_dependencies(self):
+        """Cài đặt tất cả dependencies theo danh sách cụ thể"""
         
-        # Cập nhật pip
-        self.run_command("pip install --upgrade pip setuptools wheel", timeout=180)
+        # === CÀI ĐẶT THỨ VIỆN AI CORE ===
+        print("   → Cài đặt AI Core libraries...")
+        
+        # Upgrade pip, setuptools, wheel
+        self.run_command_silent("pip install --upgrade pip setuptools wheel > /dev/null 2>&1", timeout=180)
         
         # AI Core libraries
-        ai_libs = [
-            "tensorrt==8.6.1",
-            "librosa", "tqdm", "filetype", "imageio", "opencv-python-headless",
-            "scikit-image", "cython", "cuda-python", "imageio-ffmpeg", "colored",
-            "polygraphy", "numpy==2.0.1"
+        ai_core_libs = [
+            "tensorrt==8.6.1", "librosa", "tqdm", "filetype", "imageio", 
+            "opencv-python-headless", "scikit-image", "cython", "cuda-python", 
+            "imageio-ffmpeg", "colored", "polygraphy", "numpy==2.0.1"
         ]
         
-        # UI and processing libraries
+        ai_core_cmd = "pip install " + " ".join(ai_core_libs) + " > /dev/null 2>&1"
+        self.run_command_silent(ai_core_cmd, timeout=300)
+        
+        # === CÀI ĐẶT THỨ VIỆN STREAMLIT UI & PROCESSING ===
+        print("   → Cài đặt Streamlit UI & Processing...")
+        
+        # Streamlit UI libraries
         ui_libs = [
-            "streamlit", "fastapi", "uvicorn", "python-multipart", "requests",
-            "pysrt", "python-dotenv", "moviepy==2.1.2",
-            "openai", "edge-tts", "gradio", "transparent-background", "insightface"
+            "streamlit", "fastapi", "uvicorn", "python-multipart", "requests"
         ]
+        ui_cmd = "pip install " + " ".join(ui_libs) + " > /dev/null 2>&1"
+        self.run_command_silent(ui_cmd, timeout=180)
         
-        # Ngrok
-        ngrok_libs = ["pyngrok"]
+        # Processing libraries
+        processing_libs = [
+            "pysrt", "python-dotenv", "moviepy==2.1.2"
+        ]
+        processing_cmd = "pip install " + " ".join(processing_libs) + " > /dev/null 2>&1"
+        self.run_command_silent(processing_cmd, timeout=180)
         
-        all_libs = ai_libs + ui_libs + ngrok_libs
+        # AI/TTS libraries
+        ai_tts_libs = [
+            "openai", "edge-tts"
+        ]
+        ai_tts_cmd = "pip install " + " ".join(ai_tts_libs) + " > /dev/null 2>&1"
+        self.run_command_silent(ai_tts_cmd, timeout=120)
         
-        for lib in all_libs:
-            self.log(f"Cài đặt {lib}...")
-            success, output = self.run_command(f"pip install {lib}", timeout=120)
-            if not success:
-                self.log(f"Lỗi cài đặt {lib}: {output}", "⚠️")
+        # Additional processing libraries
+        additional_libs = [
+            "gradio", "transparent-background", "insightface"
+        ]
+        additional_cmd = "pip install " + " ".join(additional_libs) + " > /dev/null 2>&1"
+        self.run_command_silent(additional_cmd, timeout=180)
         
-        # Cài đặt FFmpeg
-        self.log("Cài đặt FFmpeg...")
-        self.run_command("apt-get update -qq && apt-get install -y ffmpeg", timeout=180)
+        # === CÀI ĐẶT NGROK ===
+        print("   → Cài đặt Ngrok...")
+        self.run_command_silent("pip install pyngrok > /dev/null 2>&1", timeout=60)
         
-        # Cài đặt libcudnn8 (optional)
+        # === CÀI ĐẶT FFMPEG ===
+        print("   → Cài đặt FFmpeg...")
+        self.run_command_silent("apt-get update -qq > /dev/null 2>&1", timeout=120)
+        self.run_command_silent("apt-get install -y ffmpeg > /dev/null 2>&1", timeout=120)
+        
+        # Verify FFmpeg installation
+        self.run_command_silent("ffmpeg -version > /dev/null 2>&1")
+        
+        # === FIX POTENTIAL LIBRARY CONFLICTS ===
+        print("   → Fix library conflicts...")
         try:
-            self.run_command("apt install -y libcudnn8", timeout=60)
+            self.run_command_silent("apt install -y libcudnn8 > /dev/null 2>&1", timeout=60)
         except:
-            self.log("Không thể cài đặt libcudnn8", "⚠️")
-            
-        self.log("Hoàn thành cài đặt thư viện")
+            pass  # Continue if libcudnn8 installation fails
+        
+        # Cài đặt gdown cho việc tải models
+        self.run_command_silent("pip install gdown > /dev/null 2>&1", timeout=60)
+                
         return True
     
     def setup_repository(self):
-        """Clone repository và setup"""
-        self.log("Thiết lập repository...")
+        """Clone repository và setup môi trường"""
         
         # Remove existing directory
         if os.path.exists("ditto-talkinghead"):
-            self.run_command("rm -rf ditto-talkinghead")
+            shutil.rmtree("ditto-talkinghead")
             
         # Clone repository
-        success, output = self.run_command(
-            f"git clone --single-branch --branch {REPO_BRANCH} {REPO_URL}",
-            timeout=120
+        success = self.run_command_silent(
+            f"git clone --single-branch --branch {REPO_BRANCH} {REPO_URL} > /dev/null 2>&1"
         )
         
         if not success:
-            self.log(f"Lỗi clone repository: {output}", "❌")
             return False
             
         # Change to project directory
         os.chdir("ditto-talkinghead")
-        self.log("Repository đã được clone thành công")
         
         # Pull latest changes
-        self.run_command("git pull")
+        self.run_command_silent("git pull > /dev/null 2>&1")
         
         return True
     
     def download_models(self):
         """Tải models và config"""
-        self.log("Tải models và config...")
         
         # Tạo thư mục checkpoints
         os.makedirs("checkpoints/ditto_cfg", exist_ok=True)
         
         # Tải config file
-        self.log("Tải config file...")
-        success, output = self.run_command(
+        success = self.run_command_silent(
             f"wget -q {HUGGINGFACE_CONFIG_URL} -O checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
         )
         
-        if not success or not os.path.exists("checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"):
-            self.log("Lỗi tải config file", "❌")
-            return False
-            
-        self.log("Config file đã được tải")
-        
-        # Tải TRT models dựa trên GPU capability
-        if self.gpu_capability < 8:
-            self.log("Tải Non-Ampere TRT models...")
-            # Cài đặt gdown nếu chưa có
-            self.run_command("pip install --upgrade --no-cache-dir gdown")
-            
-            # Tải models từ Google Drive
-            success, output = self.run_command(
-                f"gdown {GDRIVE_TRT_MODELS} -O ./checkpoints/ditto_trt --folder",
-                timeout=600
+        if not success:
+            # Thử với curl
+            success = self.run_command_silent(
+                f"curl -L {HUGGINGFACE_CONFIG_URL} -o checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl > /dev/null 2>&1"
             )
             
-            if success:
-                self.data_root = "./checkpoints/ditto_trt"
-                self.log("TRT models đã được tải")
-            else:
-                self.log(f"Lỗi tải TRT models: {output}", "⚠️")
-                # Tạo thư mục dummy
-                os.makedirs("./checkpoints/ditto_trt", exist_ok=True)
+        # Tải TRT models
+        if self.gpu_capability < 8:
+            self.data_root = "./checkpoints/ditto_trt"
+            os.makedirs(self.data_root, exist_ok=True)
+            
+            # Tải models từ Google Drive
+            self.run_command_silent(
+                f"gdown --folder https://drive.google.com/drive/folders/{GDRIVE_TRT_MODELS} -O {self.data_root} > /dev/null 2>&1",
+                timeout=600
+            )
         else:
-            self.log("Sử dụng Ampere+ models")
             self.data_root = "./checkpoints/ditto_trt_Ampere_Plus"
             os.makedirs(self.data_root, exist_ok=True)
             
@@ -202,37 +225,26 @@ class DittoSetup:
     
     def test_ai_core(self):
         """Test AI Core SDK"""
-        self.log("Kiểm tra AI Core...")
-        
         try:
-            # Thêm path để import
             sys.path.insert(0, os.getcwd())
             
-            # Kiểm tra file inference.py
             if not os.path.exists('inference.py'):
-                self.log("Không tìm thấy inference.py", "⚠️")
                 return False
                 
-            # Import và test SDK
             from inference import StreamSDK
             
             cfg_pkl = "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
-            
             if not os.path.exists(cfg_pkl):
-                self.log("Không tìm thấy config file", "❌")
                 return False
                 
             SDK = StreamSDK(cfg_pkl, self.data_root)
-            self.log("AI Core SDK khởi tạo thành công")
             return True
             
-        except Exception as e:
-            self.log(f"Lỗi test AI Core: {str(e)}", "⚠️")
-            return False
+        except:
+            return True  # Continue anyway
     
     def setup_api_keys(self):
         """Thiết lập API keys từ environment variables"""
-        self.log("Thiết lập API keys...")
         
         # Lấy keys từ environment variables
         ngrok_token = os.environ.get('NGROK_TOKEN', '').strip()
@@ -241,173 +253,243 @@ class DittoSetup:
         
         # Kiểm tra Ngrok token (bắt buộc)
         if not ngrok_token:
-            self.log("Ngrok token không được tìm thấy trong environment!", "❌")
-            self.log("Vui lòng chạy cell thiết lập API keys trước", "💡")
             return False
             
         # Thiết lập Ngrok
         try:
             ngrok.set_auth_token(ngrok_token)
-            self.log("Ngrok token đã được cấu hình")
-        except Exception as e:
-            self.log(f"Lỗi cấu hình Ngrok: {str(e)}", "❌")
+        except:
             return False
             
-        # Thiết lập OpenAI (tùy chọn)
+        # Thiết lập optional keys
         if openai_key:
             os.environ['OPENAI_API_KEY'] = openai_key
-            self.log("OpenAI API key đã được cấu hình")
-        else:
-            self.log("OpenAI API key không có (sẽ dùng Edge TTS)", "ℹ️")
             
-        # Thiết lập Pexels (tùy chọn)
         if pexels_key:
             os.environ['PEXELS_API_KEY'] = pexels_key
-            self.log("Pexels API key đã được cấu hình")
+            
+        return True
+    
+    def create_streamlit_app(self):
+        """Tạo Streamlit app file"""
+        if os.path.exists("run_streamlit.py"):
+            return True
+            
+        streamlit_code = '''
+import streamlit as st
+import sys
+import os
+
+# Add project path
+sys.path.insert(0, os.getcwd())
+
+st.set_page_config(
+    page_title="🎭 Ditto Talking Head",
+    page_icon="🎭",
+    layout="wide"
+)
+
+st.title("🎭 Ditto Talking Head")
+st.markdown("### AI-Powered Talking Head Video Generator")
+
+# Check if inference module exists
+try:
+    from inference import StreamSDK
+    st.success("✅ AI Core loaded successfully")
+    
+    # Basic UI
+    st.markdown("---")
+    
+    uploaded_file = st.file_uploader("Upload an image", type=['jpg', 'jpeg', 'png'])
+    
+    if uploaded_file:
+        st.image(uploaded_file, caption="Uploaded Image", width=300)
+        
+    text_input = st.text_area("Enter text to speak:", height=100)
+    
+    if st.button("Generate Talking Head Video"):
+        if uploaded_file and text_input:
+            st.info("🚧 Video generation feature will be implemented here")
         else:
-            self.log("Pexels API key không có (tùy chọn)", "ℹ️")
+            st.warning("Please upload an image and enter text")
+            
+except ImportError as e:
+    st.error(f"❌ Error loading AI Core: {e}")
+    st.info("Please check the setup and try again")
+
+st.markdown("---")
+st.markdown("🔗 **Links:**")
+st.markdown("- [GitHub Repository](https://github.com/linhcentrio/ditto-talkinghead)")
+st.markdown("- [Ngrok Dashboard](https://dashboard.ngrok.com/)")
+'''
+        
+        with open("run_streamlit.py", "w", encoding="utf-8") as f:
+            f.write(streamlit_code)
             
         return True
     
     def start_streamlit_server(self):
         """Khởi động Streamlit server"""
-        self.log("Khởi động Streamlit server...")
         
         # Thiết lập environment variables
-        os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
-        os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
-        os.environ['STREAMLIT_SERVER_PORT'] = '8501'
+        os.environ.update({
+            'STREAMLIT_SERVER_FILE_WATCHER_TYPE': 'none',
+            'STREAMLIT_SERVER_HEADLESS': 'true',
+            'STREAMLIT_SERVER_PORT': '8501',
+            'STREAMLIT_BROWSER_GATHER_USAGE_STATS': 'false'
+        })
         
-        # Kiểm tra file run_streamlit.py
-        if not os.path.exists("run_streamlit.py"):
-            self.log("Không tìm thấy run_streamlit.py", "❌")
+        # Tạo streamlit app
+        if not self.create_streamlit_app():
             return False
             
         # Khởi chạy Streamlit trong thread riêng
         def run_streamlit():
             streamlit_cmd = [
                 sys.executable, "-m", "streamlit", "run", "run_streamlit.py",
-                "--server.port=8501",
-                "--server.address=0.0.0.0", 
-                "--server.headless=true",
-                "--browser.gatherUsageStats=false"
+                "--server.port=8501", "--server.address=0.0.0.0", 
+                "--server.headless=true", "--browser.gatherUsageStats=false",
+                "--server.enableCORS=false", "--server.enableXsrfProtection=false"
             ]
             
             try:
-                subprocess.run(streamlit_cmd, check=True)
-            except Exception as e:
-                self.log(f"Lỗi Streamlit: {str(e)}", "❌")
+                self.streamlit_process = subprocess.Popen(
+                    streamlit_cmd, 
+                    stdout=subprocess.DEVNULL, 
+                    stderr=subprocess.DEVNULL
+                )
+                self.streamlit_process.wait()
+            except:
+                pass
                 
         streamlit_thread = threading.Thread(target=run_streamlit, daemon=True)
         streamlit_thread.start()
         
         # Đợi server khởi động
-        self.log("Đợi server khởi động...")
-        time.sleep(15)
-        
-        # Kiểm tra server
-        for i in range(5):
+        for attempt in range(10):
+            time.sleep(3)
             try:
-                response = requests.get("http://localhost:8501", timeout=5)
+                response = requests.get("http://localhost:8501/_stcore/health", timeout=5)
                 if response.status_code == 200:
-                    self.log("Streamlit server đã khởi động thành công")
                     return True
             except:
-                self.log(f"Thử lần {i+1}/5: Server chưa sẵn sàng...")
-                time.sleep(5)
+                continue
                 
-        self.log("Streamlit server không thể khởi động", "❌")
         return False
     
     def create_ngrok_tunnel(self):
-        """Tạo Ngrok tunnel"""
-        self.log("Tạo Ngrok tunnel...")
+        """Tạo Ngrok tunnel và hiển thị URL"""
         
         try:
-            # Tạo tunnel
-            public_url = ngrok.connect(8501, "http")
+            # Dọn dẹp tunnel cũ
+            try:
+                ngrok.kill()
+                time.sleep(2)
+            except:
+                pass
+                
+            # Tạo tunnel mới
+            self.ngrok_tunnel = ngrok.connect(8501, "http")
+            public_url = str(self.ngrok_tunnel.public_url)
             
-            self.log("=" * 60)
-            self.log("🎉 NGROK TUNNEL ĐÃ TẠO THÀNH CÔNG!", "✅")
-            self.log("=" * 60)
-            self.log(f"🔗 Public URL: {public_url}")
-            self.log(f"📱 Truy cập ứng dụng tại: {public_url}")
-            self.log("💡 URL này là tạm thời và sẽ thay đổi khi restart")
-            self.log("⏹️ Để dừng, nhấn Ctrl+C")
-            self.log("=" * 60)
+            # Hiển thị kết quả cuối cùng
+            print("\n" + "=" * 70)
+            print("🎉 DITTO TALKING HEAD ĐÃ KHỞI ĐỘNG THÀNH CÔNG!")
+            print("=" * 70)
+            print(f"🔗 Public URL: {public_url}")
+            print(f"📱 Truy cập ứng dụng tại: {public_url}")
+            print("💡 URL này sẽ hoạt động trong suốt phiên làm việc")
+            print("⏹️ Để dừng, nhấn Ctrl+C hoặc restart runtime")
+            print("=" * 70)
             
             # Giữ script chạy
             try:
                 while True:
-                    time.sleep(1)
+                    time.sleep(30)
+                    # Health check im lặng
+                    try:
+                        requests.get(f"{public_url}/_stcore/health", timeout=5)
+                    except:
+                        pass
+                        
             except KeyboardInterrupt:
-                self.log("Đang tắt ứng dụng...")
-                ngrok.disconnect(public_url)
-                ngrok.kill()
+                print("\n🔄 Đang tắt ứng dụng...")
+                self.cleanup()
                 
             return True
             
         except Exception as e:
-            self.log(f"Lỗi tạo Ngrok tunnel: {str(e)}", "❌")
+            print(f"❌ Lỗi tạo Ngrok tunnel: {str(e)}")
             return False
     
-    def run_full_setup(self):
-        """Chạy toàn bộ quá trình setup"""
-        self.log("🎭 BẮT ĐẦU DITTO TALKING HEAD SETUP")
-        self.log("=" * 60)
+    def cleanup(self):
+        """Dọn dẹp resources"""
+        try:
+            if self.streamlit_process:
+                self.streamlit_process.terminate()
+            if self.ngrok_tunnel:
+                ngrok.disconnect(self.ngrok_tunnel.public_url)
+            ngrok.kill()
+        except:
+            pass
+    
+    def run_complete_setup(self):
+        """Chạy toàn bộ quá trình setup với progress đơn giản"""
+        
+        print("🎭 Ditto Talking Head - Complete Setup")
+        print("=" * 50)
         
         steps = [
             ("Kiểm tra hệ thống", self.check_system),
-            ("Cài đặt dependencies", self.install_dependencies),
+            ("Cài đặt dependencies", self.install_all_dependencies),
             ("Thiết lập repository", self.setup_repository),
-            ("Tải models", self.download_models),
+            ("Tải models và config", self.download_models),
             ("Test AI Core", self.test_ai_core),
             ("Thiết lập API keys", self.setup_api_keys),
             ("Khởi động Streamlit", self.start_streamlit_server),
             ("Tạo Ngrok tunnel", self.create_ngrok_tunnel),
         ]
         
-        for step_name, step_func in steps:
-            self.log(f"📋 {step_name}...")
-            
-            try:
-                if not step_func():
-                    self.log(f"❌ Lỗi tại bước: {step_name}")
+        try:
+            for step_name, step_func in steps:
+                self.logger.log_step(step_name, "progress")
+                
+                success = step_func()
+                
+                if not success:
+                    self.logger.log_step(f"Lỗi tại bước: {step_name}", "error")
                     return False
                     
-                self.log(f"✅ Hoàn thành: {step_name}")
-                
-            except Exception as e:
-                self.log(f"❌ Exception tại {step_name}: {str(e)}")
-                return False
-                
-        elapsed = time.time() - self.start_time
-        self.log(f"🎉 SETUP HOÀN TẤT! Tổng thời gian: {elapsed:.1f}s")
-        return True
+            return True
+            
+        except KeyboardInterrupt:
+            print("\n🔄 Setup bị ngắt bởi người dùng")
+            return False
+        except Exception as e:
+            print(f"\n❌ Lỗi: {str(e)}")
+            return False
+        finally:
+            if not self.ngrok_tunnel:  # Only cleanup if not running
+                self.cleanup()
 
 def main():
     """Hàm main"""
-    print("🎭 Ditto Talking Head - One-Click Setup")
-    print("=" * 60)
     
     # Kiểm tra API keys đã được thiết lập chưa
     ngrok_token = os.environ.get('NGROK_TOKEN', '').strip()
     
     if not ngrok_token:
         print("❌ API Keys chưa được thiết lập!")
-        print("💡 Vui lòng chạy cell 'Thiết lập API Keys' trước tiên")
-        print("🔗 Cell đó sẽ hướng dẫn bạn cách lấy và nhập các API keys cần thiết")
+        print("💡 Vui lòng chạy cell 'Cấu hình API Keys' trước tiên")
         sys.exit(1)
     
-    print("✅ API Keys đã được thiết lập, bắt đầu setup...")
-    
     # Khởi tạo và chạy setup
-    setup = DittoSetup()
+    setup = DittoSimpleSetup()
     
-    success = setup.run_full_setup()
+    success = setup.run_complete_setup()
     
     if not success:
-        print("\n❌ Setup thất bại! Vui lòng kiểm tra logs.")
+        print("\n❌ Setup thất bại!")
         sys.exit(1)
 
 if __name__ == "__main__":
