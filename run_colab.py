@@ -1,457 +1,415 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-🎭 Ditto Talking Head - Google Colab Setup (Optimized)
-Fast setup leveraging Colab's pre-installed PyTorch
+🎭 Ditto Talking Head - One-Click Setup for Google Colab
+Tự động cài đặt và khởi chạy toàn bộ ứng dụng trong một lần chạy
 """
 
 import os
 import sys
 import subprocess
 import time
+import threading
 import json
-import shutil
+import requests
 from pathlib import Path
-import tempfile
-from datetime import datetime
+from pyngrok import ngrok
+
+# =================== CONSTANTS ===================
+REPO_URL = "https://github.com/linhcentrio/ditto-talkinghead.git"
+REPO_BRANCH = "colab"
+HUGGINGFACE_CONFIG_URL = "https://huggingface.co/digital-avatar/ditto-talkinghead/resolve/main/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
+GDRIVE_TRT_MODELS = "https://drive.google.com/drive/folders/1-1qnqy0D9ICgRh8iNY_22j9ieNRC0-zf?usp=sharing"
+
+# API Keys - Có thể tùy chỉnh
+DEFAULT_NGROK_TOKEN = "2S0kIhV5egu7pNb3YxfTSaUR8o0_cceaYJhAW44BiDXwmGtY"
+DEFAULT_OPENAI_KEY = "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"
+DEFAULT_PEXELS_KEY = "pL5us7LHvXJkNgIFe1k4Emk7WjEopjPM98Ww4XSXghdYkAzjfeRppQpK"
 
 class DittoSetup:
     def __init__(self):
         self.start_time = time.time()
-        self.gpu_capability = None
-        self.data_root = None
+        self.gpu_capability = 6  # Default
+        self.data_root = "./checkpoints/ditto_trt"
         
-    def print_status(self, message, status="info"):
-        """Print formatted status message"""
-        icons = {"info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "❌", "working": "🔄"}
-        print(f"{icons.get(status, 'ℹ️')} {message}")
+    def log(self, message, prefix="🎭"):
+        """In log với timestamp"""
+        elapsed = time.time() - self.start_time
+        print(f"[{elapsed:6.1f}s] {prefix} {message}")
         
-    def run_command(self, cmd, silent=True, timeout=300):
-        """Run shell command with error handling"""
+    def run_command(self, cmd, capture=True, timeout=300, shell=True):
+        """Chạy lệnh với xử lý lỗi và timeout"""
         try:
-            if silent:
-                result = subprocess.run(cmd, shell=True, capture_output=True, 
-                                      text=True, timeout=timeout, check=False)
-                return result.returncode == 0, result.stdout, result.stderr
+            result = subprocess.run(
+                cmd,
+                shell=shell,
+                capture_output=capture,
+                text=True,
+                timeout=timeout
+            )
+            if result.returncode == 0:
+                return True, result.stdout
             else:
-                result = subprocess.run(cmd, shell=True, timeout=timeout, check=False)
-                return result.returncode == 0, "", ""
+                return False, result.stderr
         except subprocess.TimeoutExpired:
-            return False, "", "Command timeout"
+            return False, f"Timeout after {timeout}s"
         except Exception as e:
-            return False, "", str(e)
+            return False, str(e)
     
-    def detect_gpu_capability(self):
-        """Detect GPU architecture using Colab's PyTorch"""
-        self.print_status("Detecting GPU architecture...", "working")
+    def check_system(self):
+        """Kiểm tra hệ thống và GPU"""
+        self.log("Kiểm tra hệ thống...")
         
+        # Kiểm tra GPU
+        success, output = self.run_command("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader")
+        if success:
+            self.log(f"GPU: {output.strip()}")
+        else:
+            self.log("Không phát hiện GPU", "⚠️")
+            
+        # Kiểm tra PyTorch và CUDA
         try:
-            # Use Colab's pre-installed PyTorch
             import torch
+            self.log(f"PyTorch: {torch.__version__}")
             
             if torch.cuda.is_available():
+                gpu_name = torch.cuda.get_device_name(0)
+                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
                 self.gpu_capability = torch.cuda.get_device_capability()[0]
-                gpu_name = torch.cuda.get_device_name()
-                gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
                 
-                print(f"    🎮 GPU: {gpu_name}")
-                print(f"    🔢 Compute Capability: {self.gpu_capability}")
-                print(f"    💾 Memory: {gpu_memory:.1f}GB")
-                
-                # T4 has capability 7.5, V100 has 7.0, A100 has 8.0+
-                if self.gpu_capability >= 8:
-                    self.data_root = "./checkpoints/ditto_trt_Ampere_Plus"
-                    print(f"    🚀 Using Ampere+ optimized models")
-                else:
-                    self.data_root = "./checkpoints/ditto_trt"
-                    print(f"    📦 Using standard TRT models (T4/V100 compatible)")
+                self.log(f"CUDA: {torch.version.cuda} | GPU: {gpu_name} ({gpu_memory:.1f}GB)")
+                self.log(f"GPU Compute Capability: {self.gpu_capability}")
             else:
-                self.print_status("No CUDA GPU detected", "warning")
-                self.gpu_capability = 7  # Default for T4
-                self.data_root = "./checkpoints/ditto_trt"
+                self.log("CUDA không khả dụng", "⚠️")
                 
-        except Exception as e:
-            self.print_status(f"GPU detection failed: {e}, using T4 defaults", "warning")
-            self.gpu_capability = 7  # T4 default
-            self.data_root = "./checkpoints/ditto_trt"
+        except ImportError:
+            self.log("PyTorch chưa được cài đặt", "❌")
+            return False
             
-        self.print_status("GPU detection completed", "success")
-        
-    def install_system_dependencies(self):
-        """Install system-level dependencies"""
-        self.print_status("Installing system dependencies...", "working")
-        
-        commands = [
-            "apt-get update -qq",
-            "apt-get install -y ffmpeg",
-            "ffmpeg -version"
-        ]
-        
-        success_count = 0
-        for cmd in commands:
-            success, stdout, stderr = self.run_command(cmd)
-            if success:
-                success_count += 1
-                if "ffmpeg -version" in cmd and stdout:
-                    # Extract version info
-                    version_line = stdout.split('\n')[0] if stdout else "FFmpeg installed"
-                    print(f"    ✅ {version_line}")
-            else:
-                self.print_status(f"Warning: {cmd} failed", "warning")
-                
-        # Try to install libcudnn8 (may fail, that's ok)
-        try:
-            success, _, _ = self.run_command("apt install -y libcudnn8")
-            if success:
-                print("    ✅ libcudnn8 installed")
-            else:
-                print("    ⚠️ libcudnn8 not available, continuing...")
-        except:
-            print("    ⚠️ libcudnn8 installation skipped")
-                
-        self.print_status("System dependencies ready", "success")
-        
-    def install_ai_core_packages(self):
-        """Install AI core packages"""
-        self.print_status("Installing AI core packages...", "working")
-        
-        # AI Core packages (as specified by user)
-        ai_core_cmd = (
-            "pip install --upgrade pip setuptools wheel && "
-            "pip install tensorrt==8.6.1 librosa tqdm filetype imageio "
-            "opencv-python-headless scikit-image cython cuda-python "
-            "imageio-ffmpeg colored polygraphy numpy==2.0.1 -q"
-        )
-        
-        success, _, stderr = self.run_command(ai_core_cmd, timeout=300)
-        if success:
-            print("    ✅ AI core packages installed")
-        else:
-            self.print_status(f"AI core installation issues: {stderr[:100]}...", "warning")
-            
-        self.print_status("AI core packages ready", "success")
-        
-    def install_ui_packages(self):
-        """Install Streamlit UI and processing packages"""
-        self.print_status("Installing UI & processing packages...", "working")
-        
-        # UI packages (as specified by user)
-        ui_commands = [
-            "pip install streamlit fastapi uvicorn python-multipart requests -q",
-            "pip install pysrt python-dotenv moviepy==2.1.2 -q",
-            "pip install openai edge-tts -q",
-            "pip install gradio transparent-background insightface -q"
-        ]
-        
-        success_count = 0
-        for cmd in ui_commands:
-            success, _, _ = self.run_command(cmd, timeout=180)
-            if success:
-                success_count += 1
-                
-        print(f"    ✅ {success_count}/{len(ui_commands)} UI package groups installed")
-        self.print_status("UI packages ready", "success")
-        
-    def install_tunnel_service(self):
-        """Install tunnel service"""
-        self.print_status("Installing tunnel service...", "working")
-        
-        # Install pyngrok (as specified by user)
-        success, _, _ = self.run_command("pip install pyngrok -q")
-        if success:
-            print("    ✅ pyngrok installed")
-            
-        # Also install cloudflared as backup
-        cloudflared_commands = [
-            "wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
-            "chmod +x cloudflared-linux-amd64",
-            "sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared"
-        ]
-        
-        for cmd in cloudflared_commands:
-            self.run_command(cmd)
-            
-        # Test which tunnel service is available
-        success_ngrok, _, _ = self.run_command("python -c 'import pyngrok; print(\"pyngrok available\")'")
-        success_cf, _, _ = self.run_command("cloudflared --version")
-        
-        if success_ngrok:
-            print("    ✅ pyngrok tunnel service ready")
-        if success_cf:
-            print("    ✅ cloudflared tunnel service ready")
-            
-        self.print_status("Tunnel service ready", "success")
-        
-    def clone_repository(self):
-        """Clone the project repository"""
-        self.print_status("Downloading project files...", "working")
-        
-        if Path("ditto-talkinghead").exists():
-            os.chdir("ditto-talkinghead")
-            success, _, _ = self.run_command("git pull")
-            if success:
-                print("    ✅ Project updated")
-            else:
-                print("    ⚠️ Git pull failed, using existing files")
-        else:
-            success, _, _ = self.run_command(
-                "git clone --single-branch --branch colab https://github.com/linhcentrio/ditto-talkinghead.git"
-            )
-            if success:
-                os.chdir("ditto-talkinghead")
-                print("    ✅ Project downloaded")
-            else:
-                self.print_status("Repository cloning failed", "error")
-                return False
-                
-        self.print_status("Project files ready", "success")
         return True
+    
+    def install_dependencies(self):
+        """Cài đặt tất cả dependencies"""
+        self.log("Cài đặt thư viện cần thiết...")
         
-    def download_models(self):
-        """Download AI models based on GPU capability"""
-        self.print_status("Downloading AI models...", "working")
+        # Cập nhật pip
+        self.run_command("pip install --upgrade pip setuptools wheel", timeout=180)
         
-        # For T4 (capability 7.5) and similar, use standard models
-        if self.gpu_capability >= 8:
-            return self._download_ampere_models()
-        else:
-            return self._download_standard_models()
-            
-    def _download_ampere_models(self):
-        """Download Ampere+ optimized models"""
-        self.print_status("Downloading Ampere+ models from Hugging Face...")
+        # AI Core libraries
+        ai_libs = [
+            "tensorrt==8.6.1",
+            "librosa", "tqdm", "filetype", "imageio", "opencv-python-headless",
+            "scikit-image", "cython", "cuda-python", "imageio-ffmpeg", "colored",
+            "polygraphy", "numpy==2.0.1"
+        ]
         
+        # UI and processing libraries
+        ui_libs = [
+            "streamlit", "fastapi", "uvicorn", "python-multipart", "requests",
+            "pysrt", "python-dotenv", "moviepy==2.1.2",
+            "openai", "edge-tts", "gradio", "transparent-background", "insightface"
+        ]
+        
+        # Ngrok
+        ngrok_libs = ["pyngrok"]
+        
+        all_libs = ai_libs + ui_libs + ngrok_libs
+        
+        for lib in all_libs:
+            self.log(f"Cài đặt {lib}...")
+            success, output = self.run_command(f"pip install {lib}", timeout=120)
+            if not success:
+                self.log(f"Lỗi cài đặt {lib}: {output}", "⚠️")
+        
+        # Cài đặt FFmpeg
+        self.log("Cài đặt FFmpeg...")
+        self.run_command("apt-get update -qq && apt-get install -y ffmpeg", timeout=180)
+        
+        # Cài đặt libcudnn8 (optional)
         try:
-            if Path("checkpoints").exists():
-                success, _, _ = self.run_command("cd checkpoints && git pull", 300)
-            else:
-                success, _, _ = self.run_command(
-                    "git clone https://huggingface.co/digital-avatar/ditto-talkinghead checkpoints", 
-                    timeout=600
-                )
-                
-            if success:
-                print("    ✅ Ampere+ models downloaded")
-                return True
-            else:
-                self.print_status("Hugging Face download failed, using config-only", "warning")
-                return self._download_config_only()
-                
-        except Exception as e:
-            self.print_status(f"Ampere download error: {str(e)[:50]}...", "warning")
-            return self._download_config_only()
+            self.run_command("apt install -y libcudnn8", timeout=60)
+        except:
+            self.log("Không thể cài đặt libcudnn8", "⚠️")
             
-    def _download_standard_models(self):
-        """Download standard TRT models for T4/V100"""
-        self.print_status("Downloading T4-compatible models...")
+        self.log("Hoàn thành cài đặt thư viện")
+        return True
+    
+    def setup_repository(self):
+        """Clone repository và setup"""
+        self.log("Thiết lập repository...")
         
-        try:
-            # Create directories
-            Path("checkpoints/ditto_trt").mkdir(parents=True, exist_ok=True)
-            Path("checkpoints/ditto_cfg").mkdir(parents=True, exist_ok=True)
+        # Remove existing directory
+        if os.path.exists("ditto-talkinghead"):
+            self.run_command("rm -rf ditto-talkinghead")
             
-            # Try Google Drive download with gdown
-            self.print_status("Downloading from Google Drive (this may take 3-5 minutes)...")
-            success, _, error = self.run_command(
-                "pip install --upgrade gdown -q && "
-                "gdown https://drive.google.com/drive/folders/1-1qnqy0D9ICgRh8iNY_22j9ieNRC0-zf?usp=sharing "
-                "-O ./checkpoints/ditto_trt --folder",
-                timeout=900  # 15 minutes
-            )
-            
-            if success:
-                print("    ✅ T4 models downloaded from Google Drive")
-                return self._download_config_only()
-            else:
-                self.print_status("Google Drive download failed, using config-only mode", "warning")
-                return self._download_config_only()
-                
-        except Exception as e:
-            self.print_status(f"Standard model download error: {str(e)[:50]}...", "warning")
-            return self._download_config_only()
-            
-    def _download_config_only(self):
-        """Download essential config file"""
-        self.print_status("Downloading configuration file...")
-        
-        # Ensure config directory exists
-        Path("checkpoints/ditto_cfg").mkdir(parents=True, exist_ok=True)
-        
-        config_url = "https://huggingface.co/digital-avatar/ditto-talkinghead/resolve/main/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
-        
-        # Try wget first, then curl
-        success, _, _ = self.run_command(
-            f"wget -q -O checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl {config_url}"
+        # Clone repository
+        success, output = self.run_command(
+            f"git clone --single-branch --branch {REPO_BRANCH} {REPO_URL}",
+            timeout=120
         )
         
         if not success:
-            success, _, _ = self.run_command(
-                f"curl -L -o checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl {config_url}"
-            )
-            
-        if success and Path("checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl").exists():
-            print("    ✅ Configuration file downloaded")
-            return True
-        else:
-            self.print_status("Failed to download configuration", "error")
+            self.log(f"Lỗi clone repository: {output}", "❌")
             return False
             
-    def setup_project_structure(self):
-        """Setup project directories"""
-        self.print_status("Setting up project structure...", "working")
+        # Change to project directory
+        os.chdir("ditto-talkinghead")
+        self.log("Repository đã được clone thành công")
         
-        # Create necessary directories
-        directories = ["output", "tmp", "example", "logs"]
-        for dir_name in directories:
-            Path(dir_name).mkdir(parents=True, exist_ok=True)
+        # Pull latest changes
+        self.run_command("git pull")
+        
+        return True
+    
+    def download_models(self):
+        """Tải models và config"""
+        self.log("Tải models và config...")
+        
+        # Tạo thư mục checkpoints
+        os.makedirs("checkpoints/ditto_cfg", exist_ok=True)
+        
+        # Tải config file
+        self.log("Tải config file...")
+        success, output = self.run_command(
+            f"wget -q {HUGGINGFACE_CONFIG_URL} -O checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
+        )
+        
+        if not success or not os.path.exists("checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"):
+            self.log("Lỗi tải config file", "❌")
+            return False
             
-        # Build Cython extensions if setup.py exists
-        if Path("setup.py").exists():
-            success, _, _ = self.run_command("python setup.py build_ext --inplace", timeout=60)
-            if success:
-                print("    ✅ Cython extensions built")
+        self.log("Config file đã được tải")
+        
+        # Tải TRT models dựa trên GPU capability
+        if self.gpu_capability < 8:
+            self.log("Tải Non-Ampere TRT models...")
+            # Cài đặt gdown nếu chưa có
+            self.run_command("pip install --upgrade --no-cache-dir gdown")
             
-        # Create sample files
-        self._create_sample_files()
-        
-        self.print_status("Project structure ready", "success")
-        
-    def _create_sample_files(self):
-        """Create sample files for testing"""
-        example_dir = Path("example")
-        
-        # Create sample audio if none exists
-        if not list(example_dir.glob("*.wav")):
-            success, _, _ = self.run_command(
-                'ffmpeg -y -f lavfi -i "sine=frequency=440:duration=3" '
-                '-ac 1 -ar 16000 example/sample_audio.wav'
+            # Tải models từ Google Drive
+            success, output = self.run_command(
+                f"gdown {GDRIVE_TRT_MODELS} -O ./checkpoints/ditto_trt --folder",
+                timeout=600
             )
+            
             if success:
-                print("    ✅ Sample audio created")
-            
-        # Create sample image
-        if not list(example_dir.glob("*.jpg")):
-            try:
-                from PIL import Image, ImageDraw
-                img = Image.new('RGB', (512, 512), color='lightblue')
-                draw = ImageDraw.Draw(img)
-                draw.text((256, 256), "Sample MC", fill='black', anchor='mm')
-                img.save("example/sample_mc.jpg")
-                print("    ✅ Sample image created")
-            except:
-                pass
-                
-    def verify_installation(self):
-        """Quick verification of key components"""
-        self.print_status("Verifying installation...", "working")
-        
-        # Check key files
-        required_files = [
-            "run_streamlit.py",
-            "checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
-        ]
-        
-        missing_files = [f for f in required_files if not Path(f).exists()]
-        if missing_files:
-            self.print_status(f"Missing files: {missing_files}", "warning")
-            
-        # Test key imports
-        test_modules = ["streamlit", "numpy", "cv2", "librosa", "torch"]
-        failed_imports = []
-        
-        for module in test_modules:
-            try:
-                __import__(module)
-            except ImportError:
-                failed_imports.append(module)
-                
-        if failed_imports:
-            self.print_status(f"Import issues: {failed_imports}", "warning")
+                self.data_root = "./checkpoints/ditto_trt"
+                self.log("TRT models đã được tải")
+            else:
+                self.log(f"Lỗi tải TRT models: {output}", "⚠️")
+                # Tạo thư mục dummy
+                os.makedirs("./checkpoints/ditto_trt", exist_ok=True)
         else:
-            print("    ✅ All core modules available")
+            self.log("Sử dụng Ampere+ models")
+            self.data_root = "./checkpoints/ditto_trt_Ampere_Plus"
+            os.makedirs(self.data_root, exist_ok=True)
             
-        self.print_status("Verification completed", "success")
-        
-    def create_environment_config(self):
-        """Create environment configuration"""
-        config = {
-            'data_root': self.data_root,
-            'gpu_capability': self.gpu_capability,
-            'cfg_pkl': './checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl',
-            'setup_time': datetime.now().isoformat(),
-            'setup_duration': time.time() - self.start_time
-        }
-        
-        with open('.ditto_config.json', 'w') as f:
-            json.dump(config, f, indent=2)
-            
-        # Set environment variables
-        os.environ['DITTO_DATA_ROOT'] = self.data_root
-        os.environ['DITTO_GPU_CAPABILITY'] = str(self.gpu_capability)
-        
-        print("    ✅ Configuration saved")
-        self.print_status("Environment configured", "success")
-        
-    def run_setup(self):
-        """Run the complete setup process"""
-        print("🎭 " + "="*50)
-        print("   DITTO TALKING HEAD - COLAB SETUP")
-        print("="*52)
-        print("🚀 Optimized setup for Google Colab T4")
-        print("⏱️  Estimated time: 2-4 minutes")
-        print("="*52)
+        return True
+    
+    def test_ai_core(self):
+        """Test AI Core SDK"""
+        self.log("Kiểm tra AI Core...")
         
         try:
-            # Setup steps optimized for Colab
-            steps = [
-                ("GPU Detection", self.detect_gpu_capability),
-                ("System Dependencies", self.install_system_dependencies),
-                ("AI Core Packages", self.install_ai_core_packages),
-                ("UI Packages", self.install_ui_packages),
-                ("Tunnel Service", self.install_tunnel_service),
-                ("Project Download", self.clone_repository),
-                ("AI Models", self.download_models),
-                ("Project Setup", self.setup_project_structure),
-                ("Verification", self.verify_installation),
-                ("Configuration", self.create_environment_config)
-            ]
+            # Thêm path để import
+            sys.path.insert(0, os.getcwd())
             
-            for step_name, step_func in steps:
-                try:
-                    step_func()
-                except Exception as e:
-                    self.print_status(f"{step_name} completed with issues: {str(e)[:50]}...", "warning")
-                    
-            # Success message
-            total_time = time.time() - self.start_time
-            print("\n" + "="*52)
-            print("🎉 SETUP COMPLETED!")
-            print("="*52)
-            print(f"⏱️  Setup time: {total_time:.1f} seconds")
-            print(f"🎮 GPU: Compute {self.gpu_capability} ({'Ampere+' if self.gpu_capability >= 8 else 'T4/V100'})")
-            print(f"📁 Models: {Path(self.data_root).name}")
-            print()
-            print("✅ Ready for AI video generation!")
-            print("🚀 Run the next cell to launch the application")
-            print("="*52)
+            # Kiểm tra file inference.py
+            if not os.path.exists('inference.py'):
+                self.log("Không tìm thấy inference.py", "⚠️")
+                return False
+                
+            # Import và test SDK
+            from inference import StreamSDK
             
+            cfg_pkl = "./checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
+            
+            if not os.path.exists(cfg_pkl):
+                self.log("Không tìm thấy config file", "❌")
+                return False
+                
+            SDK = StreamSDK(cfg_pkl, self.data_root)
+            self.log("AI Core SDK khởi tạo thành công")
             return True
             
-        except KeyboardInterrupt:
-            self.print_status("Setup cancelled by user", "error")
-            return False
         except Exception as e:
-            self.print_status(f"Setup failed: {str(e)}", "error")
+            self.log(f"Lỗi test AI Core: {str(e)}", "⚠️")
             return False
+    
+    def setup_api_keys(self, ngrok_token=None, openai_key=None, pexels_key=None):
+        """Thiết lập API keys"""
+        self.log("Thiết lập API keys...")
+        
+        # Sử dụng default nếu không cung cấp
+        ngrok_token = ngrok_token or DEFAULT_NGROK_TOKEN
+        openai_key = openai_key or DEFAULT_OPENAI_KEY
+        pexels_key = pexels_key or DEFAULT_PEXELS_KEY
+        
+        if not ngrok_token.strip():
+            self.log("Ngrok token không được để trống!", "❌")
+            return False
+            
+        # Thiết lập Ngrok
+        try:
+            ngrok.set_auth_token(ngrok_token.strip())
+            self.log("Ngrok token đã được cấu hình")
+        except Exception as e:
+            self.log(f"Lỗi cấu hình Ngrok: {str(e)}", "❌")
+            return False
+            
+        # Thiết lập OpenAI
+        if openai_key.strip():
+            os.environ['OPENAI_API_KEY'] = openai_key.strip()
+            self.log("OpenAI API key đã được cấu hình")
+        else:
+            self.log("OpenAI API key không được cung cấp", "⚠️")
+            
+        # Thiết lập Pexels
+        if pexels_key.strip():
+            os.environ['PEXELS_API_KEY'] = pexels_key.strip()
+            self.log("Pexels API key đã được cấu hình")
+        else:
+            self.log("Pexels API key không được cung cấp", "⚠️")
+            
+        return True
+    
+    def start_streamlit_server(self):
+        """Khởi động Streamlit server"""
+        self.log("Khởi động Streamlit server...")
+        
+        # Thiết lập environment variables
+        os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
+        os.environ['STREAMLIT_SERVER_HEADLESS'] = 'true'
+        os.environ['STREAMLIT_SERVER_PORT'] = '8501'
+        
+        # Kiểm tra file run_streamlit.py
+        if not os.path.exists("run_streamlit.py"):
+            self.log("Không tìm thấy run_streamlit.py", "❌")
+            return False
+            
+        # Khởi chạy Streamlit trong thread riêng
+        def run_streamlit():
+            streamlit_cmd = [
+                sys.executable, "-m", "streamlit", "run", "run_streamlit.py",
+                "--server.port=8501",
+                "--server.address=0.0.0.0", 
+                "--server.headless=true",
+                "--browser.gatherUsageStats=false"
+            ]
+            
+            try:
+                subprocess.run(streamlit_cmd, check=True)
+            except Exception as e:
+                self.log(f"Lỗi Streamlit: {str(e)}", "❌")
+                
+        streamlit_thread = threading.Thread(target=run_streamlit, daemon=True)
+        streamlit_thread.start()
+        
+        # Đợi server khởi động
+        self.log("Đợi server khởi động...")
+        time.sleep(15)
+        
+        # Kiểm tra server
+        for i in range(5):
+            try:
+                response = requests.get("http://localhost:8501", timeout=5)
+                if response.status_code == 200:
+                    self.log("Streamlit server đã khởi động thành công")
+                    return True
+            except:
+                self.log(f"Thử lần {i+1}/5: Server chưa sẵn sàng...")
+                time.sleep(5)
+                
+        self.log("Streamlit server không thể khởi động", "❌")
+        return False
+    
+    def create_ngrok_tunnel(self):
+        """Tạo Ngrok tunnel"""
+        self.log("Tạo Ngrok tunnel...")
+        
+        try:
+            # Tạo tunnel
+            public_url = ngrok.connect(8501, "http")
+            
+            self.log("=" * 60)
+            self.log("🎉 NGROK TUNNEL ĐÃ TẠO THÀNH CÔNG!", "✅")
+            self.log("=" * 60)
+            self.log(f"🔗 Public URL: {public_url}")
+            self.log(f"📱 Truy cập ứng dụng tại: {public_url}")
+            self.log("💡 URL này là tạm thời và sẽ thay đổi khi restart")
+            self.log("⏹️ Để dừng, nhấn Ctrl+C")
+            self.log("=" * 60)
+            
+            # Giữ script chạy
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                self.log("Đang tắt ứng dụng...")
+                ngrok.disconnect(public_url)
+                ngrok.kill()
+                
+            return True
+            
+        except Exception as e:
+            self.log(f"Lỗi tạo Ngrok tunnel: {str(e)}", "❌")
+            return False
+    
+    def run_full_setup(self, ngrok_token=None, openai_key=None, pexels_key=None):
+        """Chạy toàn bộ quá trình setup"""
+        self.log("🎭 BẮT ĐẦU DITTO TALKING HEAD SETUP")
+        self.log("=" * 60)
+        
+        steps = [
+            ("Kiểm tra hệ thống", self.check_system),
+            ("Cài đặt dependencies", self.install_dependencies),
+            ("Thiết lập repository", self.setup_repository),
+            ("Tải models", self.download_models),
+            ("Test AI Core", self.test_ai_core),
+            ("Thiết lập API keys", lambda: self.setup_api_keys(ngrok_token, openai_key, pexels_key)),
+            ("Khởi động Streamlit", self.start_streamlit_server),
+            ("Tạo Ngrok tunnel", self.create_ngrok_tunnel),
+        ]
+        
+        for step_name, step_func in steps:
+            self.log(f"📋 {step_name}...")
+            
+            try:
+                if not step_func():
+                    self.log(f"❌ Lỗi tại bước: {step_name}")
+                    return False
+                    
+                self.log(f"✅ Hoàn thành: {step_name}")
+                
+            except Exception as e:
+                self.log(f"❌ Exception tại {step_name}: {str(e)}")
+                return False
+                
+        elapsed = time.time() - self.start_time
+        self.log(f"🎉 SETUP HOÀN TẤT! Tổng thời gian: {elapsed:.1f}s")
+        return True
 
 def main():
-    """Main setup function optimized for Colab"""
+    """Hàm main"""
+    print("🎭 Ditto Talking Head - One-Click Setup")
+    print("=" * 60)
+    
+    # Đọc API keys từ environment hoặc sử dụng default
+    ngrok_token = os.environ.get('NGROK_TOKEN', DEFAULT_NGROK_TOKEN)
+    openai_key = os.environ.get('OPENAI_API_KEY', DEFAULT_OPENAI_KEY)
+    pexels_key = os.environ.get('PEXELS_API_KEY', DEFAULT_PEXELS_KEY)
+    
+    # Khởi tạo và chạy setup
     setup = DittoSetup()
-    return setup.run_setup()
+    
+    success = setup.run_full_setup(
+        ngrok_token=ngrok_token,
+        openai_key=openai_key, 
+        pexels_key=pexels_key
+    )
+    
+    if not success:
+        print("\n❌ Setup thất bại! Vui lòng kiểm tra logs.")
+        sys.exit(1)
 
 if __name__ == "__main__":
-    success = main()
-    if not success:
-        print("\n❌ Setup incomplete. Please check errors above.")
-        print("💡 Try restarting runtime if issues persist.")
-        sys.exit(1)
+    main()
