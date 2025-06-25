@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 Ditto Talking Head - Application Launcher (Enhanced)
-Launch Streamlit app with better error handling and fallback options
+🚀 Ditto Talking Head - Standalone Application Launcher
+No config file required - auto-detect everything!
 """
 
 import os
 import sys
 import subprocess
 import time
-import json
 import threading
 import signal
 from pathlib import Path
 from datetime import datetime
 
-class DittoLauncher:
+class StandaloneLauncher:
     def __init__(self):
         self.streamlit_process = None
         self.tunnel_process = None
@@ -27,139 +26,168 @@ class DittoLauncher:
         icons = {"info": "ℹ️", "success": "✅", "warning": "⚠️", "error": "❌", "working": "🔄"}
         print(f"{icons.get(status, 'ℹ️')} {message}")
         
-    def check_setup_status(self):
-        """Enhanced setup status checking with fallback options"""
-        self.print_status("Checking setup status...", "working")
+    def auto_detect_environment(self):
+        """Auto-detect environment without config file"""
+        self.print_status("Auto-detecting environment...", "working")
         
-        # Check for config file
-        config_file = Path('.ditto_config.json')
+        # Default configuration
+        config = {
+            'data_root': './checkpoints/ditto_trt',
+            'gpu_capability': 7,  # Default for T4
+            'cfg_pkl': './checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl',
+            'setup_time': datetime.now().isoformat(),
+            'setup_type': 'auto_detected'
+        }
         
-        # Primary check: config file exists
-        if config_file.exists():
-            try:
-                with open(config_file, 'r') as f:
-                    self.config = json.load(f)
-                self.print_status("Configuration found", "success")
-                return True
-            except Exception as e:
-                self.print_status(f"Config file corrupted: {e}", "warning")
-                
-        # Secondary check: look for project structure
-        project_indicators = [
-            "ditto-talkinghead/run_streamlit.py",
-            "run_streamlit.py",
-            "checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
-        ]
-        
-        found_indicators = [p for p in project_indicators if Path(p).exists()]
-        
-        if found_indicators:
-            self.print_status(f"Found project files: {len(found_indicators)}/3", "warning")
-            self.print_status("Attempting to create fallback configuration...", "working")
-            return self._create_fallback_config()
-        
-        # No setup found at all
-        self.print_status("Setup not completed. Please run STEP 1 first.", "error")
-        self._show_setup_instructions()
-        return False
-        
-    def _create_fallback_config(self):
-        """Create fallback configuration based on available files"""
         try:
-            # Detect GPU capability
-            gpu_capability = 7  # Default for T4
-            data_root = "./checkpoints/ditto_trt"
-            
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    gpu_capability = torch.cuda.get_device_capability()[0]
-                    if gpu_capability >= 8:
-                        data_root = "./checkpoints/ditto_trt_Ampere_Plus"
-            except:
-                pass
+            # Try to detect GPU capability
+            import torch
+            if torch.cuda.is_available():
+                gpu_capability = torch.cuda.get_device_capability()[0]
+                gpu_name = torch.cuda.get_device_name()
+                config['gpu_capability'] = gpu_capability
                 
-            # Create basic config
-            self.config = {
-                'data_root': data_root,
-                'gpu_capability': gpu_capability,
-                'cfg_pkl': './checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl',
-                'setup_time': datetime.now().isoformat(),
-                'setup_type': 'fallback'
-            }
-            
-            # Save config
-            with open('.ditto_config.json', 'w') as f:
-                json.dump(self.config, f, indent=2)
-                
-            # Set environment variables
-            os.environ['DITTO_DATA_ROOT'] = data_root
-            os.environ['DITTO_GPU_CAPABILITY'] = str(gpu_capability)
-            
-            self.print_status("Fallback configuration created", "success")
-            return True
-            
-        except Exception as e:
-            self.print_status(f"Failed to create fallback config: {e}", "error")
-            return False
-            
-    def _show_setup_instructions(self):
-        """Show setup instructions"""
-        print("\n" + "="*50)
-        print("📋 SETUP REQUIRED")
-        print("="*50)
-        print("Please follow these steps:")
-        print()
-        print("1️⃣ Go back to the STEP 1 cell above")
-        print("2️⃣ Click the ▶️ button to run setup")
-        print("3️⃣ Wait for 'SETUP COMPLETED!' message")
-        print("4️⃣ Then run this cell again")
-        print()
-        print("Or run this command manually:")
-        print("!python run_colab.py")
-        print("="*50)
-        
-    def verify_environment(self):
-        """Verify the environment with enhanced checking"""
-        self.print_status("Verifying environment...", "working")
-        
-        # Navigate to project directory
-        if not Path("run_streamlit.py").exists():
-            if Path("ditto-talkinghead/run_streamlit.py").exists():
-                os.chdir("ditto-talkinghead")
-                self.print_status("Changed to project directory", "info")
+                # Choose model path based on GPU
+                if gpu_capability >= 8:
+                    config['data_root'] = './checkpoints/ditto_trt_Ampere_Plus'
+                    print(f"    🚀 Detected: {gpu_name} (Ampere+)")
+                else:
+                    config['data_root'] = './checkpoints/ditto_trt' 
+                    print(f"    🎮 Detected: {gpu_name} (T4/V100)")
             else:
-                self.print_status("Project files not found", "error")
-                return False
+                print(f"    ⚠️ No GPU detected, using CPU fallback")
                 
-        # Check critical files
-        critical_files = ["run_streamlit.py"]
-        missing_critical = [f for f in critical_files if not Path(f).exists()]
-        
-        if missing_critical:
-            self.print_status(f"Missing critical files: {missing_critical}", "error")
-            return False
+        except Exception as e:
+            print(f"    ⚠️ GPU detection failed: {str(e)[:50]}..., using defaults")
             
-        # Check optional files (warn but don't fail)
-        optional_files = [
-            "checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl",
-            "checkpoints/ditto_trt",
-            "checkpoints/ditto_trt_Ampere_Plus"
+        # Set environment variables
+        os.environ['DITTO_DATA_ROOT'] = config['data_root']
+        os.environ['DITTO_GPU_CAPABILITY'] = str(config['gpu_capability'])
+        
+        self.config = config
+        self.print_status("Environment auto-detected successfully", "success")
+        return True
+        
+    def find_project_files(self):
+        """Find and setup project files"""
+        self.print_status("Locating project files...", "working")
+        
+        # Possible locations for run_streamlit.py
+        possible_locations = [
+            "run_streamlit.py",
+            "ditto-talkinghead/run_streamlit.py",
+            "./ditto-talkinghead/run_streamlit.py"
         ]
         
-        missing_optional = [f for f in optional_files if not Path(f).exists()]
-        if missing_optional:
-            self.print_status(f"Missing optional files: {len(missing_optional)} items", "warning")
-            self.print_status("Some AI features may be limited", "warning")
+        # Find the main app file
+        app_file = None
+        for location in possible_locations:
+            if Path(location).exists():
+                app_file = location
+                break
+                
+        if app_file:
+            # Change to the correct directory
+            if "ditto-talkinghead" in app_file:
+                if not os.getcwd().endswith("ditto-talkinghead"):
+                    os.chdir("ditto-talkinghead")
+                    self.print_status("Changed to project directory", "info")
+                app_file = "run_streamlit.py"
+                
+            self.print_status(f"Found app file: {app_file}", "success")
+            return app_file
+        else:
+            self.print_status("Project files not found, attempting download...", "warning")
+            return self._download_project_files()
             
-        self.print_status("Environment verification completed", "success")
+    def _download_project_files(self):
+        """Download project files if not found"""
+        try:
+            self.print_status("Downloading project from GitHub...", "working")
+            
+            # Clone repository
+            cmd = "git clone --single-branch --branch colab https://github.com/linhcentrio/ditto-talkinghead.git"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+            
+            if result.returncode == 0 and Path("ditto-talkinghead/run_streamlit.py").exists():
+                os.chdir("ditto-talkinghead")
+                self.print_status("Project downloaded successfully", "success")
+                return "run_streamlit.py"
+            else:
+                self.print_status("Failed to download project", "error")
+                return None
+                
+        except Exception as e:
+            self.print_status(f"Download failed: {str(e)}", "error")
+            return None
+            
+    def ensure_dependencies(self):
+        """Ensure basic dependencies are installed"""
+        self.print_status("Checking dependencies...", "working")
+        
+        # Check critical packages
+        critical_packages = {
+            'streamlit': 'streamlit',
+            'cv2': 'opencv-python-headless', 
+            'numpy': 'numpy',
+            'PIL': 'pillow'
+        }
+        
+        missing_packages = []
+        for module, package in critical_packages.items():
+            try:
+                __import__(module)
+            except ImportError:
+                missing_packages.append(package)
+                
+        if missing_packages:
+            self.print_status(f"Installing missing packages: {', '.join(missing_packages)}", "working")
+            
+            install_cmd = f"pip install {' '.join(missing_packages)} -q"
+            result = subprocess.run(install_cmd, shell=True, capture_output=True)
+            
+            if result.returncode == 0:
+                self.print_status("Dependencies installed", "success")
+            else:
+                self.print_status("Some dependencies failed to install", "warning")
+        else:
+            self.print_status("All critical dependencies available", "success")
+            
+        return True
+        
+    def create_minimal_structure(self):
+        """Create minimal directory structure"""
+        directories = ["output", "tmp", "example", "logs", "checkpoints/ditto_cfg"]
+        
+        for dir_path in directories:
+            Path(dir_path).mkdir(parents=True, exist_ok=True)
+            
+        # Create a minimal config file if it doesn't exist
+        config_file = Path("checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl")
+        if not config_file.exists():
+            self.print_status("Downloading minimal configuration...", "working")
+            
+            config_url = "https://huggingface.co/digital-avatar/ditto-talkinghead/resolve/main/ditto_cfg/v0.4_hubert_cfg_trt.pkl"
+            
+            # Try wget first, then curl
+            for cmd in [
+                f"wget -q -O {config_file} {config_url}",
+                f"curl -sL -o {config_file} {config_url}"
+            ]:
+                result = subprocess.run(cmd, shell=True, capture_output=True)
+                if result.returncode == 0:
+                    self.print_status("Configuration downloaded", "success")
+                    break
+            else:
+                self.print_status("Failed to download config, will use fallback", "warning")
+                
         return True
         
     def start_streamlit(self):
-        """Start Streamlit server with enhanced configuration"""
+        """Start Streamlit server with auto-configuration"""
         self.print_status("Starting Streamlit server...", "working")
         
-        # Set comprehensive Streamlit environment
+        # Set comprehensive environment
         env = os.environ.copy()
         env.update({
             'STREAMLIT_SERVER_FILE_WATCHER_TYPE': 'none',
@@ -168,96 +196,110 @@ class DittoLauncher:
             'STREAMLIT_SERVER_ADDRESS': '0.0.0.0',
             'STREAMLIT_BROWSER_GATHER_USAGE_STATS': 'false',
             'STREAMLIT_SERVER_ENABLE_CORS': 'false',
-            'STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION': 'false'
+            'STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION': 'false',
+            'STREAMLIT_SERVER_MAX_UPLOAD_SIZE': '200'
         })
         
-        # Add config-based environment variables
+        # Add auto-detected config
         if self.config:
             env.update({
-                'DITTO_DATA_ROOT': self.config.get('data_root', './checkpoints/ditto_trt'),
-                'DITTO_GPU_CAPABILITY': str(self.config.get('gpu_capability', 7))
+                'DITTO_DATA_ROOT': self.config['data_root'],
+                'DITTO_GPU_CAPABILITY': str(self.config['gpu_capability'])
             })
         
         try:
+            # Start Streamlit
             self.streamlit_process = subprocess.Popen([
                 sys.executable, "-m", "streamlit", "run", "run_streamlit.py",
                 "--server.port=8501",
                 "--server.address=0.0.0.0", 
                 "--server.headless=true",
                 "--browser.gatherUsageStats=false",
-                "--server.fileWatcherType=none"
+                "--server.fileWatcherType=none",
+                "--server.maxUploadSize=200"
             ], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
-            # Wait for server with progress indicator
-            self.print_status("Initializing Streamlit (15s)...", "working")
-            for i in range(15):
+            # Wait for startup with progress
+            self.print_status("Initializing application...", "working")
+            startup_time = 0
+            max_startup_time = 30
+            
+            while startup_time < max_startup_time:
                 if self.streamlit_process.poll() is not None:
                     break
+                    
                 time.sleep(1)
-                if i % 3 == 0:
-                    print(f"    ⏳ {15-i}s remaining...")
-            
-            # Verify server
+                startup_time += 1
+                
+                if startup_time % 5 == 0:
+                    print(f"    ⏳ Starting up... ({startup_time}s)")
+                    
+            # Check if process is running
             if self.streamlit_process.poll() is None:
-                if self._verify_server():
+                # Try to verify server
+                if self._verify_server_basic():
+                    self.print_status("Streamlit server started successfully", "success")
                     return True
                 else:
-                    self.print_status("Server started but not responding properly", "warning")
+                    self.print_status("Server started but verification failed", "warning")
                     return True  # Continue anyway
             else:
+                # Process died, check logs
+                stdout, stderr = self.streamlit_process.communicate()
                 self.print_status("Streamlit failed to start", "error")
+                if stderr:
+                    print(f"Error: {stderr[:200]}...")
                 return False
                 
         except Exception as e:
-            self.print_status(f"Failed to start Streamlit: {e}", "error")
+            self.print_status(f"Failed to start server: {str(e)}", "error")
             return False
             
-    def _verify_server(self):
-        """Verify Streamlit server is responding"""
+    def _verify_server_basic(self):
+        """Basic server verification without external dependencies"""
         try:
-            import requests
-            for attempt in range(3):
-                try:
-                    response = requests.get("http://localhost:8501", timeout=5)
-                    if response.status_code == 200:
-                        self.print_status("Streamlit server verified", "success")
-                        return True
-                except:
-                    pass
-                time.sleep(2)
-        except ImportError:
-            # requests not available, skip verification
-            pass
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('localhost', 8501))
+            sock.close()
+            return result == 0
+        except:
+            return False
             
-        return False
-        
     def start_tunnel(self):
-        """Start tunnel with multiple service options"""
+        """Start tunnel with multiple fallback options"""
         self.print_status("Creating public tunnel...", "working")
         
-        # Try ngrok first (if available)
-        if self._try_ngrok():
-            return True
-            
-        # Fallback to cloudflared
-        if self._try_cloudflared():
-            return True
-            
-        self.print_status("Failed to create public tunnel", "error")
-        self.print_status("App will be available locally only", "warning")
+        # Try multiple tunnel services
+        tunnel_methods = [
+            self._try_ngrok,
+            self._try_cloudflared,
+            self._try_localtunnel
+        ]
+        
+        for method in tunnel_methods:
+            if method():
+                return True
+                
+        self.print_status("All tunnel methods failed", "warning")
+        self.print_status("Application available locally only", "info")
         return False
         
     def _try_ngrok(self):
-        """Try to use ngrok tunnel"""
+        """Try ngrok tunnel"""
         try:
-            from pyngrok import ngrok
-            self.print_status("Using ngrok tunnel...", "working")
+            # Check if ngrok token is available
+            ngrok_token = os.environ.get('NGROK_AUTH_TOKEN')
             
-            # Create tunnel
+            from pyngrok import ngrok
+            
+            if ngrok_token:
+                ngrok.set_auth_token(ngrok_token)
+                
+            self.print_status("Creating ngrok tunnel...", "working")
             public_url = ngrok.connect(8501, "http")
             self.public_url = str(public_url)
-            
-            self.print_status("Ngrok tunnel created", "success")
+            self.print_status("Ngrok tunnel created successfully", "success")
             return True
             
         except Exception as e:
@@ -265,17 +307,23 @@ class DittoLauncher:
             return False
             
     def _try_cloudflared(self):
-        """Try to use cloudflared tunnel"""
+        """Try cloudflared tunnel"""
         try:
-            self.print_status("Using CloudFlare tunnel...", "working")
+            self.print_status("Creating CloudFlare tunnel...", "working")
             
+            # Check if cloudflared is available
+            result = subprocess.run(["cloudflared", "--version"], 
+                                  capture_output=True, timeout=5)
+            if result.returncode != 0:
+                return False
+                
             self.tunnel_process = subprocess.Popen([
                 "cloudflared", "tunnel", "--url", "http://localhost:8501"
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             
-            # Parse tunnel URL
+            # Parse tunnel URL with timeout
             start_time = time.time()
-            while time.time() - start_time < 30:
+            while time.time() - start_time < 20:
                 if self.tunnel_process.poll() is not None:
                     break
                     
@@ -285,7 +333,7 @@ class DittoLauncher:
                     url_match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line)
                     if url_match:
                         self.public_url = url_match.group(0)
-                        self.print_status("CloudFlare tunnel created", "success")
+                        self.print_status("CloudFlare tunnel created successfully", "success")
                         return True
                         
                 time.sleep(0.5)
@@ -297,38 +345,76 @@ class DittoLauncher:
             self.print_status(f"CloudFlare failed: {str(e)[:50]}...", "warning")
             return False
             
+    def _try_localtunnel(self):
+        """Try localtunnel as final fallback"""
+        try:
+            # Install and use localtunnel
+            self.print_status("Trying localtunnel...", "working")
+            
+            # Check if npm/node is available
+            result = subprocess.run(["npm", "--version"], capture_output=True, timeout=5)
+            if result.returncode != 0:
+                return False
+                
+            # Install localtunnel
+            subprocess.run(["npm", "install", "-g", "localtunnel"], 
+                         capture_output=True, timeout=30)
+            
+            # Start tunnel
+            self.tunnel_process = subprocess.Popen([
+                "lt", "--port", "8501"
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            # Parse output for URL
+            start_time = time.time()
+            while time.time() - start_time < 15:
+                line = self.tunnel_process.stdout.readline()
+                if line and "https://" in line:
+                    import re
+                    url_match = re.search(r'https://[^\s]+', line)
+                    if url_match:
+                        self.public_url = url_match.group(0)
+                        self.print_status("Localtunnel created successfully", "success")
+                        return True
+                        
+            return False
+            
+        except Exception as e:
+            self.print_status(f"Localtunnel failed: {str(e)[:50]}...", "warning")
+            return False
+            
     def display_access_info(self):
-        """Display comprehensive access information"""
+        """Display access information"""
         print("\n" + "="*60)
-        print("🎭 DITTO TALKING HEAD - READY!")
+        print("🎭 AI VIDEO CREATOR - READY!")
         print("="*60)
         
         if self.public_url:
-            print(f"\n🔗 **PUBLIC ACCESS:**")
+            print(f"\n🔗 **PUBLIC URL:**")
             print(f"   {self.public_url}")
-            print(f"\n📱 Click the link above to access your app")
+            print(f"\n📱 Click the link above to access your AI Video Creator")
             print(f"🌍 Share this URL with others if needed")
         else:
-            print(f"\n🔗 **LOCAL ACCESS ONLY:**")
+            print(f"\n🔗 **LOCAL ACCESS:**")
             print(f"   http://localhost:8501")
-            print(f"📱 Available within this Colab session only")
+            print(f"📱 Available within this environment only")
             
-        print(f"\n🎬 **HOW TO USE:**")
-        print(f"   1. Upload MC image/video + background video")
-        print(f"   2. Add audio file OR enter text for TTS")  
-        print(f"   3. Adjust position, size, and quality")
-        print(f"   4. Click 'Create Video' and wait for result")
+        if self.config:
+            gpu_info = f"GPU Capability {self.config['gpu_capability']}"
+            model_info = Path(self.config['data_root']).name
+            print(f"\n🎮 **System**: {gpu_info}")
+            print(f"🤖 **AI Models**: {model_info}")
+            
+        print(f"\n🎬 **Quick Start:**")
+        print(f"   1. Upload MC image/video + background")
+        print(f"   2. Add audio OR enter text for AI speech")  
+        print(f"   3. Click 'Create Video' and wait for magic!")
         
-        if self.config and self.config.get('setup_type') == 'fallback':
-            print(f"\n⚠️  **NOTE:** Using fallback configuration")
-            print(f"   Some AI features may be limited")
-            print(f"   For full features, run complete setup")
-            
-        print(f"\n🛑 **TO STOP:** Interrupt this cell (■ button)")
+        print(f"\n🛑 **To Stop**: Interrupt this cell (■ button)")
         print("="*60)
         
     def cleanup(self):
-        """Enhanced cleanup"""
+        """Clean up all processes"""
         processes = [
             ("Streamlit", self.streamlit_process),
             ("Tunnel", self.tunnel_process)
@@ -339,102 +425,93 @@ class DittoLauncher:
                 try:
                     process.terminate()
                     process.wait(timeout=5)
-                    self.print_status(f"{name} stopped", "success")
                 except:
                     try:
                         process.kill()
-                        self.print_status(f"{name} force stopped", "warning")
                     except:
                         pass
                         
     def handle_interrupt(self, signum, frame):
-        """Handle keyboard interrupt gracefully"""
+        """Handle interrupt gracefully"""
         print("\n")
-        self.print_status("Stopping application...", "working")
+        self.print_status("Shutting down AI Video Creator...", "working")
         self.cleanup()
-        self.print_status("Application stopped", "success")
+        self.print_status("Stopped successfully", "success")
         sys.exit(0)
         
     def run_app(self):
-        """Run the complete application with enhanced error handling"""
-        # Setup signal handler
+        """Run the complete standalone application"""
         signal.signal(signal.SIGINT, self.handle_interrupt)
         
-        print("🎭 " + "="*40)
-        print("   DITTO TALKING HEAD LAUNCHER")
-        print("="*42)
+        print("🎬 AI Video Creator - Standalone Launcher")
+        print("="*45)
         
         try:
-            # Check setup status with fallback options
-            if not self.check_setup_status():
+            # Step 1: Auto-detect environment
+            if not self.auto_detect_environment():
                 return False
                 
-            # Verify environment
-            if not self.verify_environment():
-                self.print_status("Environment issues detected, but continuing...", "warning")
+            # Step 2: Find or download project files
+            app_file = self.find_project_files()
+            if not app_file:
+                self.print_status("Cannot locate application files", "error")
+                return False
                 
-            # Start Streamlit
+            # Step 3: Ensure dependencies
+            self.ensure_dependencies()
+            
+            # Step 4: Create minimal structure
+            self.create_minimal_structure()
+                
+            # Step 5: Start Streamlit
             if not self.start_streamlit():
-                self.print_status("Failed to start Streamlit server", "error")
+                self.print_status("Failed to start application", "error")
                 return False
                 
-            # Start tunnel (optional)
+            # Step 6: Start tunnel (optional)
             tunnel_success = self.start_tunnel()
-            if not tunnel_success:
-                self.print_status("Continuing without public tunnel", "warning")
                 
-            # Display access information
+            # Step 7: Display access info
             self.display_access_info()
             
-            # Keep running with health monitoring
+            # Step 8: Keep running
             self._run_main_loop()
             
             return True
             
         except Exception as e:
-            self.print_status(f"Application error: {e}", "error")
+            self.print_status(f"Application error: {str(e)}", "error")
             return False
             
         finally:
             self.cleanup()
             
     def _run_main_loop(self):
-        """Main application loop with health monitoring"""
+        """Main loop with health monitoring"""
         try:
             while True:
-                # Check Streamlit process
+                # Health check
                 if self.streamlit_process and self.streamlit_process.poll() is not None:
-                    self.print_status("Streamlit process stopped", "error")
+                    self.print_status("Application stopped", "error")
                     break
                     
-                # Check tunnel process (if using cloudflared)
-                if (self.tunnel_process and 
-                    self.tunnel_process.poll() is not None and 
-                    "cloudflared" in str(self.tunnel_process.args)):
-                    self.print_status("Tunnel disconnected, attempting restart...", "warning")
-                    if not self._try_cloudflared():
-                        self.print_status("Tunnel restart failed", "warning")
-                        
-                time.sleep(10)  # Check every 10 seconds
+                time.sleep(10)
                 
         except KeyboardInterrupt:
-            self.print_status("Stopping application...", "working")
+            pass
 
 def main():
-    """Enhanced main launcher function"""
-    launcher = DittoLauncher()
+    """Standalone main function"""
+    launcher = StandaloneLauncher()
     return launcher.run_app()
 
 if __name__ == "__main__":
     success = main()
     if not success:
-        print("\n" + "="*50)
-        print("❌ APPLICATION FAILED TO START")
-        print("="*50)
-        print("🔧 Troubleshooting steps:")
-        print("1. Make sure you ran STEP 1 setup first")
-        print("2. Check if setup completed successfully")
-        print("3. Try restarting runtime and run setup again")
-        print("4. If issues persist, check the error messages above")
-        print("="*50)
-        sys.exit(1)
+        print("\n" + "="*45)
+        print("❌ FAILED TO START")
+        print("="*45)
+        print("🔧 This launcher is completely standalone!")
+        print("💡 It will auto-detect and setup everything needed")
+        print("🚀 Try running again or check error messages above")
+        print("="*45)
