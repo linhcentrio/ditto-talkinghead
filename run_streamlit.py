@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Streamlit UI tối ưu cho việc tạo video MC với nền và audio thoại - Phiên bản tối ưu"""
+"""Streamlit UI tối ưu cho Google Colab - Ditto Talking Head
+Bao gồm tất cả tính năng nâng cao trừ subtitle
+"""
 
 import streamlit as st
 import subprocess
@@ -24,29 +26,56 @@ import cv2
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from video_editor import VideoEditor
 
-# Tắt chế độ theo dõi file của Streamlit để tránh lỗi segmentation fault
+# Tắt chế độ theo dõi file của Streamlit
 os.environ['STREAMLIT_SERVER_FILE_WATCHER_TYPE'] = 'none'
 
-# Thêm thư viện OpenAI mới
-from openai import AsyncOpenAI
-from openai.helpers import LocalAudioPlayer
+# Import modules
+try:
+    from video_editor import VideoEditor
+except ImportError:
+    st.error("❌ Không thể import VideoEditor. Vui lòng kiểm tra file video_editor.py")
+    st.stop()
+
+# OpenAI client
+try:
+    from openai import AsyncOpenAI
+    openai_client = AsyncOpenAI()
+except ImportError:
+    st.warning("⚠️ OpenAI client không khả dụng")
+    openai_client = None
+
+# === Cấu hình Google Colab ===
+def get_colab_config():
+    """Lấy cấu hình từ environment variables cho Google Colab"""
+    config = {
+        'data_root': os.environ.get('DITTO_DATA_ROOT', './checkpoints/ditto_trt'),
+        'gpu_arch': os.environ.get('DITTO_GPU_ARCH', 'pre_ampere'),
+        'cfg_pkl': './checkpoints/ditto_cfg/v0.4_hubert_cfg_trt.pkl'
+    }
+    
+    # Kiểm tra files tồn tại
+    if not os.path.exists(config['data_root']):
+        st.error(f"❌ Thư mục model không tìm thấy: {config['data_root']}")
+        st.info("💡 Vui lòng chạy lại cell setup models")
+        st.stop()
+    
+    if not os.path.exists(config['cfg_pkl']):
+        st.error(f"❌ File config không tìm thấy: {config['cfg_pkl']}")
+        st.info("💡 Vui lòng chạy lại cell tải config")
+        st.stop()
+    
+    return config
 
 # === Định nghĩa các bước quy trình ===
 WORKFLOW_STEPS = {
     "prepare_files": "Chuẩn bị files",
     "tts_generation": "Tạo âm thanh từ văn bản",
-    "subtitle_generation": "Tạo phụ đề từ audio",
     "talking_head_generation": "Tạo video khuôn mặt nói",
     "video_overlay": "Ghép video MC và nền",
-    "caption_application": "Thêm phụ đề vào video"
 }
 
-# === Khởi tạo OpenAI API client ===
-openai_client = AsyncOpenAI()
-
-# === Định nghĩa thông tin mô tả giọng nói ===
+# === Thông tin mô tả giọng nói ===
 VOICE_DESCRIPTIONS = {
     "Ash": "Giọng nam trưởng thành, hơi trầm, phù hợp cho phim tài liệu",
     "Ballad": "Giọng nữ mềm mại, ấm áp, phù hợp cho nội dung tư vấn",
@@ -60,9 +89,28 @@ VOICE_DESCRIPTIONS = {
     "Verse": "Giọng nam tự nhiên, cân bằng, phù hợp cho đa dạng nội dung"
 }
 
+# === Khởi tạo session state ===
+def init_session_state():
+    """Khởi tạo toàn bộ session state cần thiết"""
+    defaults = {
+        'processing': False,
+        'complete': False,
+        'output_file': None,
+        'history': [],
+        'process_start_time': None,
+        'auto_scale': True,
+        'logs': [],
+        'workflow_steps': {k: True for k in WORKFLOW_STEPS},
+        'cancel_event': None,
+        'msg_queue': None,
+    }
+    
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
 # === Hàm xác thực tham số khẩu hình ===
-def validate_mouth_params(vad_alpha=1.0, exp_components=None, exp_scale=1.0, 
-                          pose_scale=1.0, delta_exp_enabled=False, delta_exp_value=0.0):
+def validate_mouth_params(vad_alpha=1.0, exp_components=None, exp_scale=1.0, pose_scale=1.0, delta_exp_enabled=False, delta_exp_value=0.0):
     """Xác thực các tham số khẩu hình để đảm bảo chúng trong phạm vi an toàn"""
     validated = {}
     
@@ -85,102 +133,80 @@ def validate_mouth_params(vad_alpha=1.0, exp_components=None, exp_scale=1.0,
     
     return validated
 
-# === Khởi tạo session state ===
-def init_session_state():
-    """Khởi tạo toàn bộ session state cần thiết"""
-    defaults = {
-        'processing': False,
-        'complete': False,
-        'output_file': None,
-        'history': [],
-        'process_start_time': None,
-        'auto_scale': True,
-        'auto_fontsize': True,
-        'logs': [],
-    }
-
-    # Khởi tạo workflow_steps riêng để đảm bảo nó được tạo đúng
-    if 'workflow_steps' not in st.session_state:
-        st.session_state['workflow_steps'] = {k: True for k in WORKFLOW_STEPS}
-
-    # Khởi tạo các biến khác
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-# === Các hàm tiện ích ===
+# === Hàm tiện ích ===
 @lru_cache(maxsize=32)
 def get_video_resolution(video_path: str) -> Tuple[int, int]:
     """Lấy độ phân giải của video với cache"""
     try:
-        with contextmanager(lambda: cv2.VideoCapture(str(video_path)))() as cap:
-            return (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920, int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080) if cap.isOpened() else (1920, 1080)
+        cap = cv2.VideoCapture(str(video_path))
+        if cap.isOpened():
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+            cap.release()
+            return width, height
+        return 1920, 1080
     except Exception:
         return 1920, 1080
-
-def calculate_auto_fontsize(video_width: int, video_height: int) -> int:
-    """Tính toán font size phù hợp dựa trên độ phân giải video"""
-    return max(24, min(min(video_width * 24 // 1280, video_height * 24 // 720), 72))
 
 def calculate_auto_scale(mc_path: Union[str, Any], bg_width: int, bg_height: int) -> float:
     """Tính toán tỉ lệ scale phù hợp cho MC"""
     try:
         mc_width, mc_height = 0, 0
-
-        # Xử lý các loại đầu vào khác nhau với walrus operator
+        
+        # Xử lý các loại đầu vào khác nhau
         if hasattr(mc_path, 'getbuffer'):  # UploadedFile
             suffix = Path(mc_path.name).suffix.lower()
             with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp:
                 temp.write(mc_path.getbuffer())
                 temp_path = temp.name
-
+            
             try:
-                match suffix:
-                    case ext if ext in ['.jpg', '.jpeg', '.png']:
-                        if img := cv2.imread(temp_path):
-                            mc_width, mc_height = img.shape[1], img.shape[0]
-                    case _:  # Xử lý video
-                        if cap := cv2.VideoCapture(temp_path):
-                            if cap.isOpened():
-                                mc_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                                mc_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                            cap.release()
+                if suffix in ['.jpg', '.jpeg', '.png']:
+                    img = cv2.imread(temp_path)
+                    if img is not None:
+                        mc_width, mc_height = img.shape[1], img.shape[0]
+                else:  # Video
+                    cap = cv2.VideoCapture(temp_path)
+                    if cap.isOpened():
+                        mc_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        mc_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        cap.release()
             finally:
                 os.unlink(temp_path)
         else:  # Path string
             mc_path_str = str(mc_path)
             suffix = Path(mc_path_str).suffix.lower()
-
-            match suffix:
-                case ext if ext in ['.jpg', '.jpeg', '.png']:
-                    if img := cv2.imread(mc_path_str):
-                        mc_width, mc_height = img.shape[1], img.shape[0]
-                case _:  # Xử lý video
-                    if cap := cv2.VideoCapture(mc_path_str):
-                        if cap.isOpened():
-                            mc_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                            mc_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        cap.release()
-
+            
+            if suffix in ['.jpg', '.jpeg', '.png']:
+                img = cv2.imread(mc_path_str)
+                if img is not None:
+                    mc_width, mc_height = img.shape[1], img.shape[0]
+            else:  # Video
+                cap = cv2.VideoCapture(mc_path_str)
+                if cap.isOpened():
+                    mc_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    mc_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                    cap.release()
+        
         if not mc_width or not mc_height:
             return 0.25
-
+        
         # Tính toán tỉ lệ tối ưu
         width_scale = bg_width / mc_width / 3
         height_scale = bg_height / mc_height / 1.5
-
+        
         return min(round(min(width_scale, height_scale), 2), 0.5)
     except Exception:
         return 0.25
 
 def update_history_from_folder():
-    """Cập nhật lịch sử từ thư mục output sử dụng pathlib và comprehension"""
+    """Cập nhật lịch sử từ thư mục output"""
     if not (output_folder := Path("./output")).exists():
         return
-
+    
     # Lấy danh sách đường dẫn hiện có
     existing_paths = {item.get('path', '') for item in st.session_state.history}
-
+    
     # Tìm các file mới
     new_files = [
         {
@@ -191,35 +217,10 @@ def update_history_from_folder():
         for file in output_folder.glob("final_mc_*.mp4")
         if file.exists() and str(file) not in existing_paths
     ]
-
+    
     # Thêm vào lịch sử nếu có file mới
     if new_files:
         st.session_state.history.extend(new_files)
-
-def create_empty_srt(srt_path: str):
-    """Tạo file SRT trống khi bỏ qua bước tạo phụ đề"""
-    with open(srt_path, 'w', encoding='utf-8') as f:
-        f.write("""1
-00:00:00,000 --> 00:00:05,000
-Video MC Creator
-
-2
-00:00:05,000 --> 00:00:10,000
-Tạo video MC với nền và audio thoại """)
-
-def use_sample_audio(audio_path: str) -> str:
-    """Sử dụng audio mẫu khi bỏ qua bước tạo audio"""
-    # Tìm file audio mẫu
-    if sample_paths := list(Path("./example").glob("*.wav")) + list(Path("./example").glob("*.mp3")):
-        shutil.copy(str(sample_paths[0]), str(audio_path))
-        return str(sample_paths[0])
-
-    # Tạo audio im lặng 5 giây nếu không có mẫu
-    subprocess.run([
-        "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
-        "-t", "5", "-q:a", "0", "-map", "0", str(audio_path)
-    ], capture_output=True)
-    return str(audio_path)
 
 # === Hàm tạo audio bằng GPT-4o-mini-TTS ===
 async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voice: str = "shimmer") -> bool:
@@ -227,11 +228,11 @@ async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voi
     try:
         # Tạo file PCM tạm
         temp_pcm = output_path + ".pcm"
-
+        
         # Tạo audio với streaming
         async with openai_client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
-            voice=voice.lower(),  # API yêu cầu tên giọng viết thường
+            voice=voice.lower(),
             input=text,
             instructions=instructions,
             response_format="pcm",
@@ -240,19 +241,19 @@ async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voi
             with open(temp_pcm, 'wb') as f:
                 async for chunk in response.iter_bytes():
                     f.write(chunk)
-
+        
         # Chuyển đổi PCM sang MP3 bằng ffmpeg
         result = subprocess.run([
-            "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
-            "-i", temp_pcm, "-acodec", "libmp3lame", "-b:a", "192k", output_path
+            "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", temp_pcm,
+            "-acodec", "libmp3lame", "-b:a", "192k", output_path
         ], capture_output=True)
-
+        
         # Xóa file tạm
         if os.path.exists(temp_pcm):
             os.remove(temp_pcm)
-
+        
         return result.returncode == 0
-
+        
     except Exception as e:
         print(f"Lỗi tạo GPT-4o TTS: {str(e)}")
         return False
@@ -263,15 +264,15 @@ async def preview_audio_tts(text, instructions, voice, message_placeholder=None)
     try:
         if message_placeholder:
             message_placeholder.write("⏳ Đang tạo mẫu giọng nói...")
-
+        
         # Tạo tệp tạm thời
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
             temp_path = temp.name
-
+        
         # Tạo audio với streaming
         async with openai_client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
-            voice=voice.lower(),  # API yêu cầu tên giọng viết thường
+            voice=voice.lower(),
             input=text,
             instructions=instructions,
             response_format="pcm",
@@ -280,31 +281,31 @@ async def preview_audio_tts(text, instructions, voice, message_placeholder=None)
             with open(temp_path + ".pcm", 'wb') as f:
                 async for chunk in response.iter_bytes():
                     f.write(chunk)
-
+        
         # Chuyển đổi PCM sang MP3 bằng ffmpeg
         result = subprocess.run([
-            "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
-            "-i", temp_path + ".pcm", "-acodec", "libmp3lame", "-b:a", "192k", temp_path
+            "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", temp_path + ".pcm",
+            "-acodec", "libmp3lame", "-b:a", "192k", temp_path
         ], capture_output=True)
-
+        
         if result.returncode != 0:
             if message_placeholder:
                 message_placeholder.error("Không thể chuyển đổi âm thanh. Vui lòng thử lại.")
             return None
-
+        
         # Đọc file MP3 để hiển thị
         with open(temp_path, "rb") as f:
             audio_bytes = f.read()
-
+        
         # Xóa files tạm
         try:
             os.unlink(temp_path)
             os.unlink(temp_path + ".pcm")
         except:
             pass
-
+        
         return audio_bytes
-
+        
     except Exception as e:
         if message_placeholder:
             message_placeholder.error(f"Lỗi: {str(e)}")
@@ -313,43 +314,39 @@ async def preview_audio_tts(text, instructions, voice, message_placeholder=None)
 # === Handler cho các messages từ processing thread ===
 def handle_message(msg_type: str, content: Any, containers: Dict[str, Any], show_logs: bool = True):
     """Xử lý messages từ queue dựa trên loại"""
-    match msg_type:
-        case 'status':
-            containers['status'].write(content)
-        case 'progress':
-            containers['progress'].progress(content)
-        case 'log':
-            st.session_state.logs.append(content)
-            if show_logs and 'log_content' in containers and containers['log_content']:
-                containers['log_content'].code("\n".join(st.session_state.logs[-20:]))
-        case 'metrics':
-            with containers['metrics']:
-                cols = st.columns(len(content))
-                for i, (key, value) in enumerate(content.items()):
-                    cols[i].metric(key, value)
-        case 'error':
-            st.error(content)
-            st.session_state.processing = False
-        case 'complete':
-            st.session_state.processing = False
-            st.session_state.complete = True
-            st.session_state.output_file = content['output_file']
+    if msg_type == 'status':
+        containers['status'].write(content)
+    elif msg_type == 'progress':
+        containers['progress'].progress(content)
+    elif msg_type == 'log':
+        st.session_state.logs.append(content)
+        if show_logs and 'log_content' in containers and containers['log_content']:
+            containers['log_content'].code("\n".join(st.session_state.logs[-20:]))
+    elif msg_type == 'metrics':
+        with containers['metrics']:
+            cols = st.columns(len(content))
+            for i, (key, value) in enumerate(content.items()):
+                cols[i].metric(key, value)
+    elif msg_type == 'error':
+        st.error(content)
+        st.session_state.processing = False
+    elif msg_type == 'complete':
+        st.session_state.processing = False
+        st.session_state.complete = True
+        st.session_state.output_file = content['output_file']
+        
+        # Thêm vào lịch sử
+        st.session_state.history.append({
+            'path': content['output_file'],
+            'created': datetime.now(),
+            'size': content.get('file_size', 0)
+        })
 
-            # Thêm vào lịch sử
-            st.session_state.history.append({
-                'path': content['output_file'],
-                'created': datetime.now(),
-                'size': content.get('file_size', 0)
-            })
-
-# === Hàm xử lý video chung ===
-def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final, text_prompt, temp_dir, msg_queue, cancel_event, editor, timestamp, tts_service_val, tts_voice_val, tts_speed_val, tts_instructions_val="", position_val="Góc dưới phải", scale_val=0.25, caption_style_val="Style 01 (từng từ)", fontsize_val=48, caption_position_val="center", caption_zoom_val=False, zoom_size_val=0.01, quality_val="medium", ai_model_val="Mô hình mặc định", 
-                  # Thêm các tham số khẩu hình
-                  vad_alpha=1.0, exp_components=None, exp_scale=1.0, pose_scale=1.0, 
-                  delta_exp_enabled=False, delta_exp_value=0.0):
-    """Xử lý video trong thread riêng biệt, truyền vào đầy đủ tham số"""
+# === Hàm xử lý video chính ===
+def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final, text_prompt, temp_dir, msg_queue, cancel_event, editor, timestamp, tts_service_val, tts_voice_val, tts_speed_val, tts_instructions_val="", position_val="Góc dưới phải", scale_val=0.25, quality_val="medium", ai_model_val="Mô hình mặc định", vad_alpha=1.0, exp_components=None, exp_scale=1.0, pose_scale=1.0, delta_exp_enabled=False, delta_exp_value=0.0):
+    """Xử lý video trong thread riêng biệt với đầy đủ tính năng"""
     try:
-        # Xác thực tham số khẩu hình để tránh lỗi
+        # Xác thực tham số khẩu hình
         mouth_params = validate_mouth_params(
             vad_alpha, exp_components, exp_scale, pose_scale, delta_exp_enabled, delta_exp_value
         )
@@ -359,22 +356,21 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             msg_queue.put(('status', "⏳ Đang chuẩn bị files..."))
             msg_queue.put(('progress', 5))
             msg_queue.put(('log', "Bắt đầu chuẩn bị files..."))
-
+            
             # Xác định đường dẫn files tạm và đầu ra
             mc_suffix = Path(mc_path_final.name).suffix if hasattr(mc_path_final, 'name') else Path(str(mc_path_final)).suffix
             bg_suffix = Path(bg_path_final.name).suffix if hasattr(bg_path_final, 'name') and bg_path_final else ".mp4"
-
+            
             mc_temp_path = temp_dir / f"mc{mc_suffix}"
             bg_temp_path = temp_dir / f"bg{bg_suffix}" if bg_path_final else None
             audio_temp_path = temp_dir / "audio.mp3"
-            srt_path = temp_dir / "subtitle.srt"
             talking_path = temp_dir / "talking.mp4"
             output_file = editor.output_dir / f"video_mc_{timestamp}.mp4"
             final_output = editor.output_dir / f"final_mc_{timestamp}.mp4"
-
+            
             # Đảm bảo thư mục output tồn tại
             os.makedirs(editor.output_dir, exist_ok=True)
-
+            
             # Lưu files tạm
             if hasattr(mc_path_final, 'getbuffer'):  # UploadedFile
                 with open(mc_temp_path, "wb") as f:
@@ -382,7 +378,7 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                 actual_mc_path = mc_temp_path
             else:
                 actual_mc_path = mc_path_final
-
+            
             if bg_path_final:
                 if hasattr(bg_path_final, 'getbuffer'):  # UploadedFile
                     with open(bg_temp_path, "wb") as f:
@@ -392,22 +388,20 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                     actual_bg_path = bg_path_final
             else:
                 actual_bg_path = None
-
+            
             msg_queue.put(('progress', 10))
         else:
             msg_queue.put(('log', "⏩ Bỏ qua bước chuẩn bị files"))
-            # Đảm bảo các biến cần thiết được khởi tạo
+            # Thiết lập các biến cần thiết
             mc_temp_path = temp_dir / f"mc{Path(mc_path_final.name).suffix if hasattr(mc_path_final, 'name') else Path(str(mc_path_final)).suffix}"
             bg_temp_path = temp_dir / f"bg{Path(bg_path_final.name).suffix if hasattr(bg_path_final, 'name') else Path(str(bg_path_final)).suffix}" if bg_path_final else None
             audio_temp_path = temp_dir / "audio.mp3"
-            srt_path = temp_dir / "subtitle.srt"
             talking_path = temp_dir / "talking.mp4"
             output_file = editor.output_dir / f"video_mc_{timestamp}.mp4"
             final_output = editor.output_dir / f"final_mc_{timestamp}.mp4"
-
-            # Đảm bảo thư mục output tồn tại
+            
             os.makedirs(editor.output_dir, exist_ok=True)
-
+            
             # Copy files
             if hasattr(mc_path_final, 'getbuffer'):
                 with open(mc_temp_path, "wb") as f:
@@ -415,7 +409,7 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                 actual_mc_path = mc_temp_path
             else:
                 actual_mc_path = mc_path_final
-
+            
             if bg_path_final:
                 if hasattr(bg_path_final, 'getbuffer'):
                     with open(bg_temp_path, "wb") as f:
@@ -425,55 +419,25 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                     actual_bg_path = bg_path_final
             else:
                 actual_bg_path = None
-
-        # Xử lý audio và phụ đề
+        
+        # Xử lý audio
         if audio_path_final:  # Upload file
-            if workflow_dict.get("subtitle_generation", True):
-                msg_queue.put(('status', "🔊 Đang xử lý audio..."))
-                msg_queue.put(('log', "Xử lý audio từ file..."))
-
-                if hasattr(audio_path_final, 'getbuffer'):
-                    with open(audio_temp_path, "wb") as f:
-                        f.write(audio_path_final.getbuffer())
-                    actual_audio_path = audio_temp_path
-                else:
-                    actual_audio_path = audio_path_final
-
-                # Tạo phụ đề từ audio
-                msg_queue.put(('status', "📝 Đang tạo phụ đề từ audio..."))
-                msg_queue.put(('log', "Bắt đầu tạo phụ đề..."))
-                success, error = editor.generate_srt_from_audio(actual_audio_path, srt_path)
-
-                if not success:
-                    msg_queue.put(('error', f"Lỗi tạo phụ đề: {error}"))
-                    return
+            if hasattr(audio_path_final, 'getbuffer'):
+                with open(audio_temp_path, "wb") as f:
+                    f.write(audio_path_final.getbuffer())
+                actual_audio_path = audio_temp_path
             else:
-                msg_queue.put(('log', "⏩ Bỏ qua bước tạo phụ đề từ audio"))
-
-                # Vẫn xử lý audio file
-                if hasattr(audio_path_final, 'getbuffer'):
-                    with open(audio_temp_path, "wb") as f:
-                        f.write(audio_path_final.getbuffer())
-                    actual_audio_path = audio_temp_path
-                else:
-                    actual_audio_path = audio_path_final
-
-                # Tạo SRT trống hoặc mẫu nếu bỏ qua bước tạo phụ đề
-                if not workflow_dict.get("subtitle_generation", True):
-                    create_empty_srt(srt_path)
+                actual_audio_path = audio_path_final
         else:  # Tạo từ văn bản
             if workflow_dict.get("tts_generation", True):
                 msg_queue.put(('status', "🎙️ Đang tạo audio từ văn bản..."))
                 msg_queue.put(('log', "Bắt đầu tạo audio từ văn bản..."))
-
-                # Lấy cài đặt TTS từ các tham số
-                tts_service = "edge" if tts_service_val == "Edge TTS" else "openai"
-
-                # Xử lý trường hợp GPT-4o-mini-TTS
+                
+                # Xử lý TTS dựa trên service
                 if tts_service_val == "GPT-4o-mini-TTS":
-                    msg_queue.put(('log', f"Sử dụng GPT-4o-mini-TTS với giọng {tts_voice_val} để tạo giọng nói biểu cảm"))
-
-                    # Sử dụng asyncio để chạy function async trong thread đồng bộ
+                    msg_queue.put(('log', f"Sử dụng GPT-4o-mini-TTS với giọng {tts_voice_val}"))
+                    
+                    # Sử dụng asyncio để chạy function async
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     success = loop.run_until_complete(
@@ -485,62 +449,56 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                         )
                     )
                     loop.close()
-
+                    
                     if not success:
                         msg_queue.put(('error', f"Lỗi tạo audio với GPT-4o-mini-TTS"))
                         return
-
-                    # Tạo phụ đề từ audio đã tạo
-                    if workflow_dict.get("subtitle_generation", True):
-                        msg_queue.put(('status', "📝 Đang tạo phụ đề từ audio..."))
-                        success, error = editor.generate_srt_from_audio(str(audio_temp_path), srt_path)
-                        if not success:
-                            msg_queue.put(('error', f"Lỗi tạo phụ đề: {error}"))
-                            create_empty_srt(srt_path)
-                    else:
-                        create_empty_srt(srt_path)
                 else:
-                    # Sử dụng phương thức tạo audio thông thường
+                    # Sử dụng các service khác
+                    tts_service = "edge" if tts_service_val == "Edge TTS" else "openai"
                     success, error = editor.generate_audio_from_text(
                         text_prompt,
                         audio_temp_path,
-                        srt_path,
                         service=tts_service,
                         voice=tts_voice_val,
                         speed=tts_speed_val
                     )
-
+                    
                     if not success:
                         msg_queue.put(('error', f"Lỗi tạo audio: {error}"))
                         return
-
+                
                 actual_audio_path = audio_temp_path
             else:
-                msg_queue.put(('log', "⏩ Bỏ qua bước tạo audio từ văn bản"))
-                actual_audio_path = use_sample_audio(audio_temp_path)
-
-            if not workflow_dict.get("subtitle_generation", True):
-                msg_queue.put(('log', "⏩ Bỏ qua bước tạo phụ đề"))
-                create_empty_srt(srt_path)
-
+                msg_queue.put(('log', "⏩ Bỏ qua bước tạo audio"))
+                # Tạo audio mẫu
+                actual_audio_path = str(audio_temp_path)
+                subprocess.run([
+                    "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=mono",
+                    "-t", "5", "-q:a", "0", "-map", "0", str(audio_temp_path)
+                ], capture_output=True)
+        
         msg_queue.put(('progress', 30))
-
+        
         # Kiểm tra nếu đã hủy quá trình
         if cancel_event.is_set():
             msg_queue.put(('error', "Quá trình đã bị hủy bởi người dùng"))
             return
-
+        
         # Tạo video khuôn mặt nói
         if workflow_dict.get("talking_head_generation", True):
             msg_queue.put(('status', "🎭 Đang tạo video khuôn mặt nói..."))
             msg_queue.put(('log', "Bắt đầu tạo video khuôn mặt..."))
-
-            # Chọn đường dẫn mô hình dựa trên lựa chọn của người dùng
-            model_path = "./checkpoints/trt_Ampere_Plus"
+            
+            # Lấy cấu hình
+            config = get_colab_config()
+            
+            # Chọn model path dựa trên lựa chọn
             if ai_model_val == "Mô hình tối ưu hóa":
-                model_path = "./checkpoints/trt_custom"
+                model_path = config['data_root'].replace('ditto_trt', 'ditto_trt_custom')
                 msg_queue.put(('log', "Sử dụng mô hình tối ưu hóa"))
             else:
+                model_path = config['data_root']
                 msg_queue.put(('log', "Sử dụng mô hình mặc định"))
             
             # Chuẩn bị tham số khẩu hình
@@ -559,7 +517,7 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             ctrl_info = {}
             if mouth_params['vad_alpha'] < 1.0:
                 msg_queue.put(('log', f"Áp dụng mức độ chuyển động môi: {mouth_params['vad_alpha']}"))
-                for i in range(10000):  # Đủ cho hầu hết video
+                for i in range(10000):
                     ctrl_info[i] = {"vad_alpha": mouth_params['vad_alpha']}
             
             # 3. Thêm delta_exp nếu được kích hoạt
@@ -589,22 +547,21 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             if ctrl_info:
                 more_kwargs["run_kwargs"]["ctrl_info"] = ctrl_info
             
-            # Lưu more_kwargs vào file pickle để truyền vào inference.py
+            # Lưu more_kwargs vào file pickle
             more_kwargs_path = temp_dir / "more_kwargs.pkl"
             with open(more_kwargs_path, 'wb') as f:
                 pickle.dump(more_kwargs, f)
             
-            # Ước tính số frame để thêm vào log và tiến trình
+            # Ước tính số frame
             audio, sr = librosa.core.load(str(actual_audio_path), sr=16000)
             num_frames = int(len(audio) / 16000 * 25)
             msg_queue.put(('log', f"Ước tính video sẽ có khoảng {num_frames} frames"))
             
-            # Sử dụng subprocess để gọi inference.py thay vì import trực tiếp SDK
+            # Sử dụng subprocess để gọi inference.py
             cmd = [
-                "python",
-                "inference.py",
+                "python", "inference.py",
                 "--data_root", model_path,
-                "--cfg_pkl", "./checkpoints/cfg/v0.4_hubert_cfg_trt.pkl",
+                "--cfg_pkl", config['cfg_pkl'],
                 "--audio_path", str(actual_audio_path),
                 "--source_path", str(actual_mc_path),
                 "--output_path", str(talking_path),
@@ -615,7 +572,11 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             
             # Khởi chạy tiến trình inference với theo dõi output
             process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
             )
             
             # Xử lý output
@@ -635,12 +596,12 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                 # Đọc một dòng từ stdout
                 if line := process.stdout.readline():
                     # Lọc ANSI escape sequences
-                    clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-? ]*[ -/]*[@-~])', '', line.strip())
+                    clean = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', line.strip())
                     if not clean or "aligned" in clean:
                         continue
                     
                     # Xử lý thông tin audio processing
-                    if "dit:" in clean and (m := re.search(r'dit: (\d+)it . *? (\d+\.\d+)?it/s', clean)):
+                    if "dit:" in clean and (m := re.search(r'dit: (\d+)it.*?(\d+\.\d+)?it/s', clean)):
                         step, speed = int(m.group(1)), float(m.group(2) or 0)
                         progress_value = min(30 + step/10*10, 40)
                         msg_queue.put(('progress', int(progress_value)))
@@ -650,7 +611,7 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                             msg_queue.put(('log', f"➡️ Audio processing: {step}/10 ({speed:.1f}it/s)"))
                     
                     # Xử lý thông tin frame video
-                    elif "writer:" in clean and (m := re.search(r'writer: (\d+)it . *? (\d+\.\d+)?it/s', clean)):
+                    elif "writer:" in clean and (m := re.search(r'writer: (\d+)it.*?(\d+\.\d+)?it/s', clean)):
                         frame, speed = int(m.group(1)), float(m.group(2) or 0)
                         frame_count, fps = frame, speed
                         progress_value = min(40 + frame/400*20, 60)
@@ -660,7 +621,6 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                         if frame % 50 == 0 or frame <= 5:
                             msg_queue.put(('log', f"🎬 Video: frame {frame} ({speed:.1f} fps)"))
                 else:
-                    # Tránh tiêu tốn CPU
                     time.sleep(0.1)
             
             # Đọc stderr output để ghi log
@@ -673,19 +633,17 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                 msg_queue.put(('log', "Dùng ffmpeg trực tiếp để tạo video khuôn mặt nói"))
                 
                 fallback_cmd = [
-                    "ffmpeg", "-y", 
+                    "ffmpeg", "-y",
                     "-loop", "1" if Path(str(actual_mc_path)).suffix.lower() in ['.jpg', '.jpeg', '.png'] else "-i",
                     str(actual_mc_path),
                     "-i", str(actual_audio_path),
                     "-c:v", "libx264",
-                    "-tune", "stillimage" if Path(str(actual_mc_path)).suffix.lower() in ['.jpg', '.jpeg', '.png'] else None,
                     "-c:a", "aac",
                     "-shortest", str(talking_path)
                 ]
                 # Lọc bỏ các tham số None
                 fallback_cmd = [cmd for cmd in fallback_cmd if cmd is not None]
                 
-                msg_queue.put(('log', f"Lệnh fallback: {' '.join(fallback_cmd)}"))
                 result = subprocess.run(fallback_cmd, capture_output=True, text=True)
                 
                 if result.returncode != 0 or not os.path.exists(talking_path):
@@ -704,27 +662,23 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             else:
                 # Nếu là ảnh, tạo video tĩnh từ ảnh
                 ffmpeg_cmd = [
-                    "ffmpeg", "-y", "-loop", "1", "-i", str(actual_mc_path), 
-                    "-i", str(actual_audio_path), "-c:v", "libx264", 
-                    "-tune", "stillimage", "-c:a", "aac", "-shortest", str(talking_path)
+                    "ffmpeg", "-y", "-loop", "1", "-i", str(actual_mc_path),
+                    "-i", str(actual_audio_path), "-c:v", "libx264", "-tune", "stillimage",
+                    "-c:a", "aac", "-shortest", str(talking_path)
                 ]
                 subprocess.run(ffmpeg_cmd, capture_output=True)
+            
+            msg_queue.put(('progress', 60))
         
-        msg_queue.put(('progress', 60))
-        
-        # Nếu đang ở tab "Tạo Video Khuôn Mặt AI", hoặc bỏ qua bước ghép video,
-        # thì dùng talking_path làm kết quả cuối cùng
+        # Nếu không có background, sử dụng talking head làm kết quả cuối
         if actual_bg_path is None or not workflow_dict.get("video_overlay", True):
-            # Đây là tab "Tạo Video Khuôn Mặt AI" hoặc bỏ qua bước ghép video
             msg_queue.put(('log', "Dùng video khuôn mặt nói làm kết quả cuối cùng"))
             shutil.copy(str(talking_path), str(final_output))
             
-            # Hoàn tất
             msg_queue.put(('progress', 100))
             msg_queue.put(('status', "✅ Hoàn thành!"))
             msg_queue.put(('log', "Xử lý video hoàn tất!"))
             
-            # Thêm vào lịch sử và hoàn thành
             msg_queue.put(('complete', {
                 'output_file': str(final_output),
                 'file_size': os.path.getsize(final_output) / (1024*1024),
@@ -743,13 +697,13 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             msg_queue.put(('status', "🎬 Đang ghép video..."))
             msg_queue.put(('log', "Bắt đầu ghép video..."))
             
-            # Truyền trực tiếp tên tiếng Việt (không chuyển sang tiếng Anh)
+            # Truyền trực tiếp tên tiếng Việt
             overlay_cmd = [
-                "python", "video_overlay.py", 
-                "-m", str(talking_path), 
-                "-b", str(actual_bg_path), 
+                "python", "video_overlay.py",
+                "-m", str(talking_path),
+                "-b", str(actual_bg_path),
                 "-o", str(output_file),
-                "-p", position_val,  # Truyền trực tiếp tên tiếng Việt
+                "-p", position_val,
                 "-s", str(scale_val),
                 "-q", quality_val
             ]
@@ -757,11 +711,11 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             msg_queue.put(('log', f"Chạy lệnh ghép video: {' '.join(overlay_cmd)}"))
             
             try:
-                # Chạy lệnh với timeout để tránh treo
+                # Chạy lệnh với timeout
                 result = subprocess.run(
-                    overlay_cmd, 
-                    capture_output=True, 
-                    text=True, 
+                    overlay_cmd,
+                    capture_output=True,
+                    text=True,
                     timeout=1800  # 30 phút
                 )
                 
@@ -789,7 +743,11 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                         "ffmpeg", "-y",
                         "-i", str(actual_bg_path),
                         "-i", str(talking_path),
-                        "-filter_complex", f"[1:v]scale=iw*{scale_val}:-1[overlay];[0:v][overlay]overlay={pos}"
+                        "-filter_complex", f"[1:v]scale=iw*{scale_val}:ih*{scale_val}[overlay];[0:v][overlay]overlay={pos}",
+                        "-c:v", "libx264",
+                        "-preset", {"low": "ultrafast", "medium": "medium", "high": "slow"}.get(quality_val, "medium"),
+                        "-crf", "23",
+                        str(output_file)
                     ]
                     
                     # Thêm audio mapping
@@ -812,16 +770,7 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
                             else:
                                 fallback_cmd.append("-an")
                     except Exception:
-                        # Mặc định giữ audio từ background nếu kiểm tra thất bại
-                        fallback_cmd.extend(["-map", "0:a? ", "-c:a", "aac"])
-                    
-                    # Thêm cài đặt video và đường dẫn output
-                    fallback_cmd.extend([
-                        "-c:v", "libx264",
-                        "-preset", {"low": "ultrafast", "medium": "medium", "high": "slow"}.get(quality_val, "medium"),
-                        "-crf", "23",
-                        str(output_file)
-                    ])
+                        fallback_cmd.extend(["-map", "0:a?", "-c:a", "aac"])
                     
                     msg_queue.put(('log', f"Lệnh fallback: {' '.join(fallback_cmd)}"))
                     fallback_result = subprocess.run(fallback_cmd, capture_output=True, text=True, timeout=1800)
@@ -857,48 +806,8 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             msg_queue.put(('error', "Quá trình đã bị hủy bởi người dùng"))
             return
         
-        # Áp dụng phụ đề theo style đã chọn
-        if workflow_dict.get("caption_application", True):
-            msg_queue.put(('status', "🔤 Đang thêm phụ đề..."))
-            msg_queue.put(('log', f"Thêm phụ đề kiểu: {caption_style_val}"))
-            
-            try:
-                # Kiểm tra file SRT
-                if not os.path.exists(srt_path):
-                    msg_queue.put(('error', f"Không tìm thấy file phụ đề SRT: {srt_path}"))
-                    return
-                
-                if caption_style_val == "Style 01 (từng từ)":
-                    success, error = editor.apply_caption_style_01(
-                        output_file,
-                        srt_path,
-                        final_output,
-                        actual_audio_path,
-                        fontsize_val
-                    )
-                else:  # Style 02 (gradient)
-                    success, error = editor.apply_caption_style_02(
-                        output_file,
-                        srt_path,
-                        final_output,
-                        actual_audio_path,
-                        fontsize_val,
-                        caption_position_val,
-                        caption_zoom_val,
-                        zoom_size_val
-                    )
-                
-                if not success:
-                    msg_queue.put(('error', f"Lỗi khi thêm phụ đề: {error}"))
-                    return
-            except Exception as e:
-                error_details = traceback.format_exc()
-                msg_queue.put(('error', f"Lỗi không xác định khi thêm phụ đề: {str(e)}\n{error_details}"))
-                return
-        else:
-            msg_queue.put(('log', "⏩ Bỏ qua bước thêm phụ đề"))
-            # Sử dụng video không có phụ đề làm kết quả cuối cùng
-            shutil.copy(str(output_file), str(final_output))
+        # Sử dụng output_file làm kết quả cuối cùng (không có subtitle)
+        shutil.copy(str(output_file), str(final_output))
         
         # Hoàn tất
         msg_queue.put(('progress', 100))
@@ -911,7 +820,7 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
             # Thử copy file output nếu có
             if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
                 shutil.copy(output_file, final_output)
-                msg_queue.put(('log', f"Đã sao chép video không có phụ đề làm kết quả cuối cùng"))
+                msg_queue.put(('log', f"Đã sao chép video làm kết quả cuối cùng"))
             else:
                 return
         
@@ -933,32 +842,65 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
         except Exception as e:
             msg_queue.put(('log', f"Lỗi khi dọn dẹp: {str(e)}"))
 
+# === Main App ===
 def main():
-    # Đảm bảo session_state được khởi tạo
+    # Cấu hình trang
+    st.set_page_config(
+        page_title="🎭 Ditto Talking Head",
+        page_icon="🎭",
+        layout="wide"
+    )
+    
+    # Khởi tạo session state
     init_session_state()
     
-    st.set_page_config(page_title="Video AI Creator", page_icon="🎬", layout="wide")
+    # Lấy cấu hình
+    config = get_colab_config()
     
-    # Hiển thị logo và tiêu đề ứng dụng
-    # col1, col2 = st.columns([1, 5])
-    # with col1:
-    #     st.image("/home/image_talking/aiclip_logo.png", width=100)
-    # with col2:
-    #     st.title("🎬 Video AI Creator")
-    #     st.caption("Powered by [aiclip.ai](https://aiclip.ai/)")
+    # Header
+    st.title("🎭 Ditto Talking Head")
+    st.caption("Tạo video khuôn mặt nói với AI - Phiên bản Google Colab")
+    
+    # Hiển thị thông tin cấu hình
+    with st.expander("⚙️ Thông tin hệ thống", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"📁 **Models**: {config['data_root']}")
+            st.info(f"🎮 **GPU**: {config['gpu_arch']}")
+        with col2:
+            st.info(f"📊 **Config**: {config['cfg_pkl']}")
+            st.info(f"🔧 **Trạng thái**: {'✅ Sẵn sàng' if os.path.exists(config['data_root']) else '❌ Chưa sẵn sàng'}")
     
     # Khởi tạo editor
     editor = VideoEditor(output_dir="./output")
-
+    
     # === Sidebar cho cài đặt ===
     with st.sidebar:
-        st.title("⚙️ Cài đặt")
-        show_logs = st.checkbox("Hiển thị logs", value=False)  # Mặc định không hiển thị logs
+        st.title("⚙️ Cài đặt chung")
+        
+        # Workflow configuration
+        st.subheader("🔄 Quy trình xử lý")
+        workflow_steps = {}
+        for step_id, step_name in WORKFLOW_STEPS.items():
+            workflow_steps[step_id] = st.checkbox(
+                step_name,
+                value=st.session_state.workflow_steps.get(step_id, True),
+                key=f"workflow_{step_id}"
+            )
+        st.session_state.workflow_steps = workflow_steps
+        
+        # Quality settings
+        st.subheader("📊 Chất lượng")
         quality = st.select_slider(
             "Chất lượng video",
             options=["low", "medium", "high"],
-            value="medium"
+            value="medium",
+            format_func=lambda x: {"low": "Thấp", "medium": "Trung bình", "high": "Cao"}[x]
         )
+        
+        # Show logs
+        show_logs = st.checkbox("Hiển thị logs chi tiết", value=False)
+        
         st.divider()
         
         with st.expander("💡 Mẹo sử dụng", expanded=False):
@@ -973,406 +915,234 @@ def main():
             - Nền: MP4
             - Audio: WAV, MP3
             """)
-
+    
     # === Tabs chính ===
-    tabs = st.tabs(["Tạo Video MC", "Tạo Video Khuôn Mặt AI", "Quy Trình", "Lịch Sử", "Hướng Dẫn"])
-
+    tabs = st.tabs(["🎬 Tạo Video MC", "🎭 Video Khuôn Mặt AI", "🎙️ Text-to-Speech", "📋 Lịch Sử", "❓ Hướng Dẫn"])
+    
     # === Tab 0: Tạo Video MC ===
     with tabs[0]:
-        # Chia thành 2 cột
         col1, col2 = st.columns([3, 2])
         
         with col1:
-            # Subtabs cho input
-            input_tabs = st.tabs(["Input Files", "MC Settings", "Caption Settings"])
+            st.subheader("📁 Tải lên files")
             
-            # === Tab Input Files ===
-            with input_tabs[0]:
-                st.subheader("Tải lên và cài đặt")
-                
-                # MC uploader
-                mc_file = st.file_uploader("Tải lên Ảnh/Video MC", type=["png", "jpg", "jpeg", "mp4"])
-                if mc_file:
-                    # Hiển thị preview cho file đã upload
-                    if Path(mc_file.name).suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                        st.image(mc_file, use_container_width=True, caption="MC Preview")
-                    else:
-                        st.video(mc_file)
+            # MC uploader
+            mc_file = st.file_uploader(
+                "Tải lên Ảnh/Video MC",
+                type=["png", "jpg", "jpeg", "mp4"],
+                help="Ảnh hoặc video của người MC"
+            )
+            if mc_file:
+                if Path(mc_file.name).suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                    st.image(mc_file, use_container_width=True, caption="Xem trước MC")
                 else:
-                    mc_path = st.selectbox(
-                        "Hoặc chọn file mẫu:",
-                        options=[""] + [str(p) for p in Path("./example").glob("*.[jp][pn]g")] + [str(p) for p in Path("./example").glob("*mc*.mp4")],
-                        format_func=lambda x: Path(x).name if x else "Chọn file mẫu..."
-                    )
-                    if mc_path:
-                        if Path(mc_path).suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                            st.image(mc_path, use_container_width=True, caption="MC Preview")
-                        else:
-                            st.video(mc_path)
-                
-                # BG uploader
-                bg_file = st.file_uploader("Tải lên Video Nền", type=["mp4"])
-                if bg_file:
-                    # Hiển thị preview cho video nền đã upload
-                    st.video(bg_file)
-                else:
-                    bg_path = st.selectbox(
-                        "Hoặc chọn video nền mẫu:",
-                        options=[""] + [str(p) for p in Path("./example").glob("*bg*.mp4")],
-                        format_func=lambda x: Path(x).name if x else "Chọn video nền mẫu...",
-                        key="bg_sample"
-                    )
-                    if bg_path:
-                        st.video(bg_path)
-                
-                # Audio source
-                audio_source = st.radio("Nguồn audio:", ["Upload file", "Tạo từ văn bản"], horizontal=True)
-                
-                if audio_source == "Upload file":
-                    audio_file = st.file_uploader("Tải lên Audio thoại", type=["wav", "mp3"])
-                    if audio_file:
-                        # Hiển thị preview cho audio đã upload
-                        st.audio(audio_file)
+                    st.video(mc_file)
+            else:
+                mc_path = st.selectbox(
+                    "Hoặc chọn file mẫu:",
+                    options=[""] + [str(p) for p in Path("./example").glob("*.[jp][pn]g")] + [str(p) for p in Path("./example").glob("*mc*.mp4")],
+                    format_func=lambda x: Path(x).name if x else "Chọn file mẫu...",
+                    key="mc_sample"
+                )
+                if mc_path:
+                    if Path(mc_path).suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                        st.image(mc_path, use_container_width=True, caption="Xem trước MC")
                     else:
-                        audio_path = st.selectbox(
-                            "Hoặc chọn audio mẫu:",
-                            options=[""] + [str(p) for p in Path("./example").glob("*.wav")] + [str(p) for p in Path("./example").glob("*.mp3")],
-                            format_func=lambda x: Path(x).name if x else "Chọn audio mẫu..."
-                        )
-                        if audio_path:
-                            st.audio(audio_path)
-                    text_prompt = None
-                else:  # Tạo từ văn bản
-                    audio_file = None
-                    audio_path = None
-                    text_prompt = st.text_area("Nhập văn bản thoại:", height=150)
+                        st.video(mc_path)
+            
+            # BG uploader
+            bg_file = st.file_uploader(
+                "Tải lên Video Nền",
+                type=["mp4"],
+                help="Video nền để ghép với MC"
+            )
+            if bg_file:
+                st.video(bg_file)
+            else:
+                bg_path = st.selectbox(
+                    "Hoặc chọn video nền mẫu:",
+                    options=[""] + [str(p) for p in Path("./example").glob("*bg*.mp4")],
+                    format_func=lambda x: Path(x).name if x else "Chọn video nền mẫu...",
+                    key="bg_sample"
+                )
+                if bg_path:
+                    st.video(bg_path)
+            
+            # Audio source
+            audio_source = st.radio(
+                "Nguồn audio:",
+                ["Upload file", "Tạo từ văn bản"],
+                horizontal=True
+            )
+            
+            if audio_source == "Upload file":
+                audio_file = st.file_uploader(
+                    "Tải lên Audio thoại",
+                    type=["wav", "mp3"]
+                )
+                if audio_file:
+                    st.audio(audio_file)
+                else:
+                    audio_path = st.selectbox(
+                        "Hoặc chọn audio mẫu:",
+                        options=[""] + [str(p) for p in Path("./example").glob("*.wav")] + [str(p) for p in Path("./example").glob("*.mp3")],
+                        format_func=lambda x: Path(x).name if x else "Chọn audio mẫu...",
+                        key="audio_sample"
+                    )
+                    if audio_path:
+                        st.audio(audio_path)
+                text_prompt = None
+            else:
+                audio_file = None
+                audio_path = None
+                text_prompt = st.text_area(
+                    "Nhập văn bản thoại:",
+                    height=150,
+                    placeholder="Nhập nội dung bạn muốn MC nói..."
+                )
                 
-                # TTS settings - CHỈ HIỂN THỊ KHI CHỌN "TẠO TỪ VĂN BẢN"
-                if audio_source == "Tạo từ văn bản":
-                    with st.expander("Cài đặt TTS", expanded=True):
+                # TTS settings ngắn gọn
+                if text_prompt:
+                    with st.expander("🎙️ Cài đặt TTS nhanh", expanded=True):
                         tts_service = st.selectbox(
                             "Dịch vụ TTS:",
                             options=["Edge TTS", "OpenAI TTS", "GPT-4o-mini-TTS"],
-                            index=2,  # Mặc định chọn GPT-4o-mini-TTS
-                            key="tts_service"
+                            index=0,
+                            key="tts_service_main"
                         )
                         
-                        # Hiển thị các tùy chọn giọng nói dựa trên dịch vụ
                         if tts_service == "Edge TTS":
-                            voice_options = ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]
-                            
                             tts_voice = st.selectbox(
                                 "Giọng đọc:",
-                                options=voice_options,
-                                index=0,
-                                key="tts_voice"
+                                options=["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"],
+                                key="tts_voice_main"
                             )
-                            
-                            # Hiển thị điều chỉnh tốc độ cho Edge TTS
-                            tts_speed = st.slider(
-                                "Tốc độ đọc:",
-                                min_value=0.8,
-                                max_value=1.5,
-                                value=1.2,
-                                step=0.1,
-                                key="tts_speed"
-                            )
-                            
-                            # Đặt giá trị mặc định cho tts_instructions
+                            tts_speed = st.slider("Tốc độ:", 0.8, 1.5, 1.2, 0.1, key="tts_speed_main")
                             tts_instructions = ""
-                            
                         elif tts_service == "OpenAI TTS":
-                            voice_options = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-                            
                             tts_voice = st.selectbox(
                                 "Giọng đọc:",
-                                options=voice_options,
-                                index=0,
-                                key="tts_voice"
+                                options=["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
+                                key="tts_voice_main"
                             )
-                            
-                            # Hiển thị điều chỉnh tốc độ cho OpenAI TTS
-                            tts_speed = st.slider(
-                                "Tốc độ đọc:",
-                                min_value=0.8,
-                                max_value=1.5,
-                                value=1.2,
-                                step=0.1,
-                                key="tts_speed"
-                            )
-                            
-                            # Đặt giá trị mặc định cho tts_instructions
+                            tts_speed = st.slider("Tốc độ:", 0.8, 1.5, 1.2, 0.1, key="tts_speed_main")
                             tts_instructions = ""
-                            
                         else:  # GPT-4o-mini-TTS
-                            voice_options = ["Ash", "Ballad", "Coral", "Echo", "Fable", "Onyx", "Nova", "Sage", "Shimmer", "Verse"]
-                            
-                            st.write("**🔊 Chọn giọng nói và nghe thử:**")
-                            
                             tts_voice = st.selectbox(
                                 "Giọng đọc:",
-                                options=voice_options,
-                                index=voice_options.index("Shimmer") if "Shimmer" in voice_options else 0,
-                                key="tts_voice"
+                                options=["Ash", "Ballad", "Coral", "Echo", "Fable", "Onyx", "Nova", "Sage", "Shimmer", "Verse"],
+                                index=8,
+                                key="tts_voice_main"
                             )
-                            
-                            # Hiển thị mô tả ngắn gọn của giọng đọc đã chọn
-                            st.caption(f"**{tts_voice}**: {VOICE_DESCRIPTIONS.get(tts_voice, '')}")
-                            
-                            # Thêm trường hướng dẫn giọng nói cho GPT-4o-mini-TTS
+                            tts_speed = 1.2
                             tts_instructions = st.text_area(
-                                "Hướng dẫn về giọng điệu:",
-                                value="""Tone: Tự nhiên, trôi chảy, chuyên nghiệp
-Emotion: Nhiệt tình, tự tin
-Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan trọng""",
-                                height=100,
-                                key="tts_instructions",
-                                help="Mô tả tông giọng, cảm xúc và cách truyền đạt mong muốn"
-                            )
-                        
-                            # Tạo mẫu văn bản để nghe thử
-                            if text_prompt:
-                                sample_text = text_prompt[:200] + "..." if len(text_prompt) > 200 else text_prompt
-                            else:
-                                sample_text = "Xin chào! Đây là mẫu thử giọng nói từ GPT-4o. Bạn có thể điều chỉnh văn bản này để nghe thử trước khi tạo video."
-                            
-                            preview_text = st.text_area(
-                                "Văn bản mẫu để nghe thử:",
-                                value=sample_text,
+                                "Hướng dẫn giọng điệu:",
+                                value="Tone: Tự nhiên, trôi chảy\nEmotion: Nhiệt tình, tự tin\nDelivery: Rõ ràng, nhịp độ vừa phải",
                                 height=80,
-                                key="preview_text"
-                            )
-                            
-                            preview_message = st.empty()
-                            preview_audio = st.empty()
-                            
-                            # Nút nghe thử
-                            if st.button("🔊 Nghe thử giọng nói", use_container_width=True, key="tts_preview"):
-                                if not preview_text.strip():
-                                    preview_message.warning("Vui lòng nhập văn bản mẫu để nghe thử")
-                                else:
-                                    # Sử dụng asyncio
-                                    audio_bytes = asyncio.run(preview_audio_tts(
-                                        preview_text,
-                                        tts_instructions,
-                                        tts_voice,
-                                        preview_message
-                                    ))
-                                    
-                                    if audio_bytes:
-                                        preview_message.success("✅ Tạo mẫu giọng nói thành công!")
-                                        preview_audio.audio(audio_bytes, format="audio/mp3")
-                        
-                        # Hiển thị các thông tin tham khảo về giọng nói và hướng dẫn (bên ngoài expander)
-                        if tts_service == "GPT-4o-mini-TTS":
-                            st.divider()
-                            st.subheader("🔊 Tham khảo về giọng nói GPT-4o-mini-TTS")
-                            
-                            voice_info_col, examples_col = st.columns(2)
-                            
-                            with voice_info_col:
-                                st.markdown("**Đặc điểm của các giọng nói:**")
-                                st.markdown("""
-                                - **Ash**: Giọng nam trưởng thành, hơi trầm, phù hợp cho phim tài liệu
-                                - **Ballad**: Giọng nữ mềm mại, ấm áp, phù hợp cho nội dung tư vấn
-                                - **Coral**: Giọng nữ trẻ, rõ ràng, tự tin, phù hợp cho nội dung giáo dục
-                                - **Echo**: Giọng nam trẻ, năng động, phù hợp cho quảng cáo
-                                - **Fable**: Giọng nam uy tín, phù hợp cho thông báo chính thức
-                                - **Onyx**: Giọng nam trầm, sang trọng, phù hợp cho thuyết trình
-                                - **Nova**: Giọng nữ chuyên nghiệp, phù hợp cho tin tức
-                                - **Sage**: Giọng nữ từng trải, ấm áp, phù hợp cho podcast
-                                - **Shimmer**: Giọng nữ tươi sáng, năng động, phù hợp cho giải trí
-                                - **Verse**: Giọng nam tự nhiên, cân bằng, phù hợp cho đa dạng nội dung
-                                """)
-                            
-                            with examples_col:
-                                st.markdown("**Ví dụ về hướng dẫn giọng nói:**")
-                                st.markdown("""
-                                **Giọng diễn thuyết:**
-                                ```
-                                Tone: Đĩnh đạc, trang trọng, đầy tự tin
-                                Emotion: Nhiệt huyết, quyết đoán
-                                Delivery: Nhịp độ vừa phải với các ngắt quãng, nhấn mạnh từ khóa quan trọng
-                                ```
-                                
-                                **Giọng tư vấn:**
-                                ```
-                                Tone: Ấm áp, thân thiện, đáng tin cậy
-                                Emotion: Thấu hiểu, quan tâm
-                                Delivery: Nhẹ nhàng, rõ ràng, tạo cảm giác an tâm
-                                ```
-                                
-                                **Giọng quảng cáo:**
-                                ```
-                                Tone: Sôi nổi, cuốn hút, năng động
-                                Emotion: Phấn khích, hào hứng
-                                Delivery: Nhanh, đầy năng lượng, với cường độ tăng dần
-                                ```
-                                """)
-            
-            # === Tab MC Settings ===
-            with input_tabs[1]:
-                st.subheader("Tùy chỉnh MC")
-                
-                # Vị trí và kích thước
-                p_col, s_col = st.columns(2)
-                with p_col:
-                    position = st.selectbox(
-                        "Vị trí MC",
-                        ["Góc trên trái", "Góc trên phải", "Góc dưới trái", "Góc dưới phải", "Chính giữa"],
-                        index=3
-                    )
-                
-                with s_col:
-                    # Auto scale checkbox
-                    auto_scale = st.checkbox(
-                        "Tự động điều chỉnh kích thước",
-                        value=st.session_state.auto_scale
-                    )
-                    st.session_state.auto_scale = auto_scale
-                    
-                    # Tính toán scale
-                    scale = 0.25  # Mặc định
-                    if auto_scale and bg_file:
-                        try:
-                            # Lưu file bg tạm và lấy kích thước
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=Path(bg_file.name).suffix) as temp:
-                                temp.write(bg_file.getbuffer())
-                                bg_temp_path = temp.name
-                            
-                            width, height = get_video_resolution(bg_temp_path)
-                            
-                            os.unlink(bg_temp_path)
-                            
-                            # Tính scale tự động
-                            scale = calculate_auto_scale(mc_file if mc_file else mc_path, width, height)
-                            st.write(f"Kích thước tự động: {scale:.2f}")
-                        except Exception:
-                            scale = 0.25
-                    elif auto_scale and bg_path:
-                        try:
-                            width, height = get_video_resolution(bg_path)
-                            scale = calculate_auto_scale(mc_file if mc_file else mc_path, width, height)
-                            st.write(f"Kích thước tự động: {scale:.2f}")
-                        except Exception:
-                            scale = 0.25
-                    else:
-                        scale = st.slider("Kích thước", 0.1, 0.5, 0.25, 0.05)
-                
-                # Thêm phần tùy chỉnh khẩu hình
-                with st.expander("🗣️ Tùy chỉnh khẩu hình", expanded=False):
-                    # Điều chỉnh mức độ chuyển động môi
-                    vad_alpha = st.slider(
-                        "Mức độ chuyển động môi:",
-                        min_value=0.0,
-                        max_value=1.0,
-                        value=1.0,
-                        step=0.05,
-                        help="Giá trị thấp hơn sẽ làm giảm chuyển động môi, giá trị cao hơn sẽ tăng chuyển động"
-                    )
-                    
-                    # Tùy chọn nâng cao
-                    mouth_advanced = st.checkbox("Tùy chọn nâng cao cho khẩu hình", value=False)
-                    if mouth_advanced:
-                        # Chọn các thành phần biểu cảm
-                        exp_components = st.multiselect(
-                            "Thành phần biểu cảm:",
-                            options=["exp", "pitch", "yaw", "roll", "t"],
-                            default=["exp", "pitch", "yaw", "roll", "t"],
-                            help="Chọn các thành phần biểu cảm để sử dụng từ mô hình"
-                        )
-                        
-                        # Điều chỉnh tỷ lệ cho các thành phần
-                        exp_scale = st.slider(
-                            "Tỷ lệ biểu cảm miệng (exp):",
-                            min_value=0.5,
-                            max_value=1.5,
-                            value=1.0,
-                            step=0.1,
-                            help="Điều chỉnh tỷ lệ biểu cảm miệng"
-                        )
-                        
-                        pose_scale = st.slider(
-                            "Tỷ lệ chuyển động đầu (pitch, yaw, roll):",
-                            min_value=0.5,
-                            max_value=1.5,
-                            value=1.0,
-                            step=0.1,
-                            help="Điều chỉnh tỷ lệ chuyển động đầu"
-                        )
-                        
-                        # Điều chỉnh offset biểu cảm môi
-                        delta_exp_enabled = st.checkbox("Thêm offset biểu cảm môi", value=False)
-                        if delta_exp_enabled:
-                            delta_exp_value = st.slider(
-                                "Giá trị offset:",
-                                min_value=-0.2,
-                                max_value=0.2,
-                                value=0.0,
-                                step=0.01
+                                key="tts_instructions_main"
                             )
             
-            # === Tab Caption Settings ===
-            with input_tabs[2]:
-                st.subheader("Tùy chỉnh phụ đề")
-                
-                # Style phụ đề
-                caption_style = st.radio(
-                    "Kiểu phụ đề:",
-                    ["Style 01 (từng từ)", "Style 02 (gradient)"],
-                    horizontal=True,
-                    index=0
+            # MC Settings
+            st.subheader("🎛️ Cài đặt MC")
+            
+            # Position and scale
+            col_p, col_s = st.columns(2)
+            with col_p:
+                position = st.selectbox(
+                    "Vị trí MC",
+                    ["Góc trên trái", "Góc trên phải", "Góc dưới trái", "Góc dưới phải", "Chính giữa"],
+                    index=3
+                )
+            
+            with col_s:
+                auto_scale = st.checkbox(
+                    "Tự động điều chỉnh kích thước",
+                    value=st.session_state.auto_scale
+                )
+                st.session_state.auto_scale = auto_scale
+            
+            # Scale calculation
+            scale = 0.25
+            if auto_scale and bg_file:
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=Path(bg_file.name).suffix) as temp:
+                        temp.write(bg_file.getbuffer())
+                        bg_temp_path = temp.name
+                    
+                    width, height = get_video_resolution(bg_temp_path)
+                    os.unlink(bg_temp_path)
+                    
+                    scale = calculate_auto_scale(mc_file if mc_file else mc_path, width, height)
+                    st.write(f"Kích thước tự động: {scale:.2f}")
+                except Exception:
+                    scale = 0.25
+            elif auto_scale and 'bg_path' in locals() and bg_path:
+                try:
+                    width, height = get_video_resolution(bg_path)
+                    scale = calculate_auto_scale(mc_file if mc_file else mc_path, width, height)
+                    st.write(f"Kích thước tự động: {scale:.2f}")
+                except Exception:
+                    scale = 0.25
+            else:
+                scale = st.slider("Kích thước", 0.1, 0.5, 0.25, 0.05)
+            
+            # Advanced mouth controls
+            with st.expander("🗣️ Điều khiển khẩu hình nâng cao", expanded=False):
+                vad_alpha = st.slider(
+                    "Mức độ chuyển động môi:",
+                    min_value=0.0, max_value=1.0, value=1.0, step=0.05,
+                    help="Giá trị thấp hơn sẽ làm giảm chuyển động môi"
                 )
                 
-                # Auto fontsize
-                auto_fontsize = st.checkbox(
-                    "Tự động điều chỉnh kích thước phụ đề",
-                    value=st.session_state.auto_fontsize
-                )
-                st.session_state.auto_fontsize = auto_fontsize
-                
-                # Tính toán fontsize
-                fontsize = 48  # Mặc định
-                if auto_fontsize and bg_file:
-                    try:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=Path(bg_file.name).suffix) as temp:
-                            temp.write(bg_file.getbuffer())
-                            bg_temp_path = temp.name
-                        
-                        width, height = get_video_resolution(bg_temp_path)
-                        
-                        os.unlink(bg_temp_path)
-                        
-                        fontsize = calculate_auto_fontsize(width, height)
-                        st.write(f"Kích thước phụ đề tự động: {fontsize}")
-                    except Exception:
-                        fontsize = 48
-                elif auto_fontsize and bg_path:
-                    try:
-                        width, height = get_video_resolution(bg_path)
-                        fontsize = calculate_auto_fontsize(width, height)
-                        st.write(f"Kích thước phụ đề tự động: {fontsize}")
-                    except Exception:
-                        fontsize = 48
+                mouth_advanced = st.checkbox("Tùy chọn nâng cao", value=False)
+                if mouth_advanced:
+                    exp_components = st.multiselect(
+                        "Thành phần biểu cảm:",
+                        options=["exp", "pitch", "yaw", "roll", "t"],
+                        default=["exp", "pitch", "yaw", "roll", "t"],
+                        help="Chọn các thành phần biểu cảm để sử dụng"
+                    )
+                    
+                    exp_scale = st.slider(
+                        "Tỷ lệ biểu cảm miệng:",
+                        min_value=0.5, max_value=1.5, value=1.0, step=0.1
+                    )
+                    
+                    pose_scale = st.slider(
+                        "Tỷ lệ chuyển động đầu:",
+                        min_value=0.5, max_value=1.5, value=1.0, step=0.1
+                    )
+                    
+                    delta_exp_enabled = st.checkbox("Thêm offset biểu cảm môi", value=False)
+                    delta_exp_value = 0.0
+                    if delta_exp_enabled:
+                        delta_exp_value = st.slider(
+                            "Giá trị offset:",
+                            min_value=-0.2, max_value=0.2, value=0.0, step=0.01
+                        )
                 else:
-                    fontsize = st.slider("Kích thước phụ đề:", 24, 100, 48, 2)
-                
-                # Cài đặt cho Style 02
-                caption_position, caption_zoom, zoom_size = "center", False, 0.01
-                if caption_style == "Style 02 (gradient)":
-                    caption_position = st.selectbox("Vị trí phụ đề:", ["center", "top", "bottom"], index=0)
-                    caption_zoom = st.checkbox("Hiệu ứng zoom phụ đề", value=True)
-                    zoom_size = st.slider("Độ lớn hiệu ứng zoom:", 0.005, 0.05, 0.01, 0.005) if caption_zoom else 0.01
+                    exp_components = None
+                    exp_scale = 1.0
+                    pose_scale = 1.0
+                    delta_exp_enabled = False
+                    delta_exp_value = 0.0
             
-            # Nút "Tạo Video"
+            # AI Model selection
+            ai_model = st.selectbox(
+                "Mô hình AI:",
+                options=["Mô hình mặc định", "Mô hình tối ưu hóa"],
+                help="Chọn mô hình AI để tạo video",
+                index=0
+            )
+            
+            # Submit button
             submitted = st.button(
-                "🚀 Tạo Video",
+                "🚀 Tạo Video MC",
                 use_container_width=True,
                 type="primary",
                 disabled=st.session_state.processing
             )
         
-        # === Cột hiển thị tiến trình và kết quả ===
         with col2:
             # Tạo các placeholder cho UI trạng thái
             elapsed_time_container = st.empty()
@@ -1399,11 +1169,11 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                 if show_logs:
                     log_container.markdown("**Logs:**")
                     log_content = log_container.code("\n".join(st.session_state.logs[-20:]))
-            
+                
             elif st.session_state.complete and st.session_state.output_file:
                 status_container.subheader("✅ Đã hoàn thành!")
-                
                 output_file = st.session_state.output_file
+                
                 if Path(output_file).exists():
                     metrics_container.video(output_file)
                     
@@ -1424,37 +1194,143 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                         )
             else:
                 status_container.subheader("Trạng thái")
-                metrics_container.info("Nhấn nút 'Tạo Video' để bắt đầu xử lý...")
+                metrics_container.info("Nhấn nút 'Tạo Video MC' để bắt đầu xử lý...")
+                
+                # Preview chỉ hiển thị nếu không đang trong quá trình xử lý hoặc hoàn thành
+                if mc_file or ('mc_path' in locals() and mc_path):
+                    preview_container = log_container.container()
+                    preview_container.subheader("Xem trước MC")
+                    if mc_file:
+                        if Path(mc_file.name).suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                            preview_container.image(mc_file, use_container_width=True)
+                        else:
+                            preview_container.video(mc_file)
+                    elif 'mc_path' in locals() and mc_path:
+                        if Path(mc_path).suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                            preview_container.image(mc_path, use_container_width=True)
+                        else:
+                            preview_container.video(mc_path)
+        
+        # Xử lý khi submit
+        if submitted and not st.session_state.processing:
+            # Xác định đường dẫn các files
+            mc_path_final = mc_file if mc_file else (mc_path if 'mc_path' in locals() and mc_path else None)
+            bg_path_final = bg_file if bg_file else (bg_path if 'bg_path' in locals() and bg_path else None)
+            audio_path_final = audio_file if audio_file else (audio_path if 'audio_path' in locals() and audio_path else None)
             
-            # Preview chỉ hiển thị nếu không đang trong quá trình xử lý hoặc hoàn thành
-            if mc_file or (mc_path if 'mc_path' in locals() else None):
-                preview_container = log_container.container()
-                preview_container.subheader("MC Preview")
-                if mc_file:
-                    if Path(mc_file.name).suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                        preview_container.image(mc_file, use_container_width=True)
-                    else:
-                        preview_container.video(mc_file)
-                elif 'mc_path' in locals() and mc_path:
-                    if Path(mc_path).suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                        preview_container.image(mc_path, use_container_width=True)
-                    else:
-                        preview_container.video(mc_path)
-
+            if ((mc_path_final and bg_path_final) and (audio_path_final or text_prompt)):
+                st.session_state.processing = True
+                st.session_state.process_start_time = time.time()
+                st.session_state.logs = ["Bắt đầu quá trình xử lý video MC..."]
+                
+                # Cập nhật UI trạng thái ban đầu
+                status_container.subheader("⏳ Đang xử lý...")
+                elapsed = time.time() - st.session_state.process_start_time
+                elapsed_time_container.caption(f"Thời gian xử lý: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}")
+                progress = progress_container.progress(0)
+                cancel_button = cancel_container.button("🛑 Hủy xử lý", key="cancel_processing", use_container_width=True)
+                if show_logs:
+                    log_container.markdown("**Logs:**")
+                    log_content = log_container.code("Đang bắt đầu...")
+                
+                # Tạo tempdir và đường dẫn
+                temp_dir = Path(tempfile.mkdtemp())
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                
+                # Chuẩn bị hàng đợi giao tiếp
+                msg_queue = queue.Queue()
+                cancel_event = threading.Event()
+                
+                # Chuẩn bị containers cho handler
+                ui_containers = {
+                    'status': status_container,
+                    'progress': progress,
+                    'log_content': log_content if show_logs else None,
+                    'metrics': metrics_container
+                }
+                
+                # Chuẩn bị dữ liệu để truyền cho thread
+                tts_service_val = tts_service if audio_source == "Tạo từ văn bản" else "Edge TTS"
+                tts_voice_val = tts_voice if audio_source == "Tạo từ văn bản" else "vi-VN-NamMinhNeural"
+                tts_speed_val = tts_speed if audio_source == "Tạo từ văn bản" and tts_service != "GPT-4o-mini-TTS" else 1.2
+                tts_instructions_val = tts_instructions if audio_source == "Tạo từ văn bản" and tts_service == "GPT-4o-mini-TTS" else ""
+                
+                # Khởi chạy thread xử lý
+                thread = threading.Thread(
+                    target=process_video,
+                    args=(
+                        st.session_state.workflow_steps,
+                        mc_path_final, bg_path_final, audio_path_final, text_prompt,
+                        temp_dir, msg_queue, cancel_event, editor, timestamp,
+                        tts_service_val, tts_voice_val, tts_speed_val,
+                    ),
+                    kwargs={
+                        'tts_instructions_val': tts_instructions_val,
+                        'position_val': position,
+                        'scale_val': scale,
+                        'quality_val': quality,
+                        'ai_model_val': ai_model,
+                        'vad_alpha': vad_alpha,
+                        'exp_components': exp_components,
+                        'exp_scale': exp_scale,
+                        'pose_scale': pose_scale,
+                        'delta_exp_enabled': delta_exp_enabled,
+                        'delta_exp_value': delta_exp_value,
+                    }
+                )
+                thread.daemon = True
+                thread.start()
+                
+                # UI theo dõi tiến trình
+                try:
+                    while thread.is_alive() or not msg_queue.empty():
+                        # Cập nhật thời gian xử lý
+                        if st.session_state.process_start_time:
+                            elapsed = time.time() - st.session_state.process_start_time
+                            elapsed_time_container.caption(f"Thời gian xử lý: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}")
+                        
+                        # Kiểm tra nếu đã nhấn nút hủy
+                        if cancel_button:
+                            cancel_event.set()
+                            st.session_state.processing = False
+                            st.warning("Đã hủy quá trình xử lý")
+                            break
+                        
+                        # Xử lý thông điệp
+                        try:
+                            msg_type, content = msg_queue.get(timeout=0.1)
+                            handle_message(msg_type, content, ui_containers, show_logs)
+                            msg_queue.task_done()
+                            
+                            if msg_type == 'complete':
+                                time.sleep(0.5)
+                                st.rerun()
+                        except queue.Empty:
+                            time.sleep(0.1)
+                        
+                        time.sleep(0.05)
+                except Exception as e:
+                    st.error(f"Lỗi UI: {str(e)}")
+                    st.session_state.processing = False
+            else:
+                st.error("Vui lòng chọn đầy đủ: MC, video nền, và audio (hoặc nhập văn bản)")
+    
     # === Tab 1: Tạo Video Khuôn Mặt AI ===
     with tabs[1]:
         st.subheader("🎭 Tạo Video Khuôn Mặt Nói với AI")
         st.write("Chuyển đổi ảnh hoặc video MC tĩnh thành video với khả năng nói theo audio")
         
-        # Chia thành 2 cột
         ai_col1, ai_col2 = st.columns([3, 2])
         
         with ai_col1:
-            # Input files section
-            st.subheader("Tải lên files đầu vào")
+            st.subheader("📁 Tải lên files đầu vào")
             
             # MC uploader
-            ai_mc_file = st.file_uploader("Tải lên Ảnh/Video MC", type=["png", "jpg", "jpeg", "mp4"], key="ai_mc_file")
+            ai_mc_file = st.file_uploader(
+                "Tải lên Ảnh/Video MC",
+                type=["png", "jpg", "jpeg", "mp4"],
+                key="ai_mc_file"
+            )
             if ai_mc_file:
                 if Path(ai_mc_file.name).suffix.lower() in ['.jpg', '.jpeg', '.png']:
                     st.image(ai_mc_file, use_container_width=True, caption="MC Preview")
@@ -1474,10 +1350,19 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                         st.video(ai_mc_path)
             
             # Audio source
-            ai_audio_source = st.radio("Nguồn audio:", ["Upload file", "Tạo từ văn bản"], horizontal=True, key="ai_audio_source")
+            ai_audio_source = st.radio(
+                "Nguồn audio:",
+                ["Upload file", "Tạo từ văn bản"],
+                horizontal=True,
+                key="ai_audio_source"
+            )
             
             if ai_audio_source == "Upload file":
-                ai_audio_file = st.file_uploader("Tải lên Audio thoại", type=["wav", "mp3"], key="ai_audio_file")
+                ai_audio_file = st.file_uploader(
+                    "Tải lên Audio thoại",
+                    type=["wav", "mp3"],
+                    key="ai_audio_file"
+                )
                 if ai_audio_file:
                     st.audio(ai_audio_file)
                 else:
@@ -1490,175 +1375,59 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                     if ai_audio_path:
                         st.audio(ai_audio_path)
                 ai_text_prompt = None
-            else:  # Tạo từ văn bản
+            else:
                 ai_audio_file = None
                 ai_audio_path = None
-                ai_text_prompt = st.text_area("Nhập văn bản thoại:", height=150, key="ai_text_prompt")
-            
-            # TTS settings
-            if ai_audio_source == "Tạo từ văn bản":
-                with st.expander("Cài đặt TTS", expanded=True):
-                    ai_tts_service = st.selectbox(
-                        "Dịch vụ TTS:",
-                        options=["Edge TTS", "OpenAI TTS", "GPT-4o-mini-TTS"],
-                        index=2,  # Mặc định chọn GPT-4o-mini-TTS
-                        key="ai_tts_service"
-                    )
-                    
-                    # Hiển thị các tùy chọn giọng nói dựa trên dịch vụ
-                    if ai_tts_service == "Edge TTS":
-                        ai_voice_options = ["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"]
-                        
-                        ai_tts_voice = st.selectbox(
-                            "Giọng đọc:",
-                            options=ai_voice_options,
-                            index=0,
-                            key="ai_tts_voice"
+                ai_text_prompt = st.text_area(
+                    "Nhập văn bản thoại:",
+                    height=150,
+                    key="ai_text_prompt",
+                    placeholder="Nhập nội dung bạn muốn MC nói..."
+                )
+                
+                # TTS settings cho AI mode
+                if ai_text_prompt:
+                    with st.expander("🎙️ Cài đặt TTS", expanded=True):
+                        ai_tts_service = st.selectbox(
+                            "Dịch vụ TTS:",
+                            options=["Edge TTS", "OpenAI TTS", "GPT-4o-mini-TTS"],
+                            index=2,
+                            key="ai_tts_service"
                         )
                         
-                        # Hiển thị điều chỉnh tốc độ cho Edge TTS
-                        ai_tts_speed = st.slider(
-                            "Tốc độ đọc:",
-                            min_value=0.8,
-                            max_value=1.5,
-                            value=1.2,
-                            step=0.1,
-                            key="ai_tts_speed"
-                        )
-                        
-                        # Đặt giá trị mặc định cho ai_tts_instructions
-                        ai_tts_instructions = ""
-                        
-                    elif ai_tts_service == "OpenAI TTS":
-                        ai_voice_options = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
-                        
-                        ai_tts_voice = st.selectbox(
-                            "Giọng đọc:",
-                            options=ai_voice_options,
-                            index=0,
-                            key="ai_tts_voice"
-                        )
-                        
-                        # Hiển thị điều chỉnh tốc độ cho OpenAI TTS
-                        ai_tts_speed = st.slider(
-                            "Tốc độ đọc:",
-                            min_value=0.8,
-                            max_value=1.5,
-                            value=1.2,
-                            step=0.1,
-                            key="ai_tts_speed"
-                        )
-                        
-                        # Đặt giá trị mặc định cho ai_tts_instructions
-                        ai_tts_instructions = ""
-                        
-                    else:  # GPT-4o-mini-TTS
-                        ai_voice_options = ["Ash", "Ballad", "Coral", "Echo", "Fable", "Onyx", "Nova", "Sage", "Shimmer", "Verse"]
-                        
-                        st.write("**🔊 Chọn giọng nói và nghe thử:**")
-                        
-                        ai_tts_voice = st.selectbox(
-                            "Giọng đọc:",
-                            options=ai_voice_options,
-                            index=ai_voice_options.index("Shimmer") if "Shimmer" in ai_voice_options else 0,
-                            key="ai_tts_voice"
-                        )
-                        
-                        # Hiển thị mô tả ngắn gọn của giọng đọc đã chọn
-                        st.caption(f"**{ai_tts_voice}**: {VOICE_DESCRIPTIONS.get(ai_tts_voice, '')}")
-                        
-                        # Thêm trường hướng dẫn giọng nói
-                        ai_tts_instructions = st.text_area(
-                            "Hướng dẫn về giọng điệu:",
-                            value="""Tone: Tự nhiên, trôi chảy, chuyên nghiệp
-Emotion: Nhiệt tình, tự tin
-Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan trọng""",
-                            height=100,
-                            key="ai_tts_instructions"
-                        )
-                        
-                        # Tạo mẫu văn bản để nghe thử
-                        if ai_text_prompt:
-                            ai_sample_text = ai_text_prompt[:200] + "..." if len(ai_text_prompt) > 200 else ai_text_prompt
+                        if ai_tts_service == "Edge TTS":
+                            ai_tts_voice = st.selectbox(
+                                "Giọng đọc:",
+                                options=["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"],
+                                key="ai_tts_voice"
+                            )
+                            ai_tts_speed = st.slider("Tốc độ:", 0.8, 1.5, 1.2, 0.1, key="ai_tts_speed")
+                            ai_tts_instructions = ""
+                        elif ai_tts_service == "OpenAI TTS":
+                            ai_tts_voice = st.selectbox(
+                                "Giọng đọc:",
+                                options=["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
+                                key="ai_tts_voice"
+                            )
+                            ai_tts_speed = st.slider("Tốc độ:", 0.8, 1.5, 1.2, 0.1, key="ai_tts_speed")
+                            ai_tts_instructions = ""
                         else:
-                            ai_sample_text = "Xin chào! Đây là mẫu thử giọng nói từ GPT-4o. Bạn có thể điều chỉnh văn bản này để nghe thử trước khi tạo video."
-                        
-                        ai_preview_text = st.text_area(
-                            "Văn bản mẫu để nghe thử:",
-                            value=ai_sample_text,
-                            height=80,
-                            key="ai_preview_text"
-                        )
-                        
-                        ai_preview_message = st.empty()
-                        ai_preview_audio = st.empty()
-                        
-                        # Nút nghe thử
-                        if st.button("🔊 Nghe thử giọng nói", use_container_width=True, key="ai_tts_preview"):
-                            if not ai_preview_text.strip():
-                                ai_preview_message.warning("Vui lòng nhập văn bản mẫu để nghe thử")
-                            else:
-                                # Sử dụng asyncio
-                                audio_bytes = asyncio.run(preview_audio_tts(
-                                    ai_preview_text,
-                                    ai_tts_instructions,
-                                    ai_tts_voice,
-                                    ai_preview_message
-                                ))
-                                
-                                if audio_bytes:
-                                    ai_preview_message.success("✅ Tạo mẫu giọng nói thành công!")
-                                    ai_preview_audio.audio(audio_bytes, format="audio/mp3")
-                        
-                        # Hiển thị các thông tin tham khảo về giọng nói và hướng dẫn (bên ngoài expander)
-                        if ai_tts_service == "GPT-4o-mini-TTS":
-                            st.divider()
-                            st.subheader("🔊 Tham khảo về giọng nói GPT-4o-mini-TTS")
-                            
-                            ai_voice_info_col, ai_examples_col = st.columns(2)
-                            
-                            with ai_voice_info_col:
-                                st.markdown("**Đặc điểm của các giọng nói:**")
-                                st.markdown("""
-                                - **Ash**: Giọng nam trưởng thành, hơi trầm, phù hợp cho phim tài liệu
-                                - **Ballad**: Giọng nữ mềm mại, ấm áp, phù hợp cho nội dung tư vấn
-                                - **Coral**: Giọng nữ trẻ, rõ ràng, tự tin, phù hợp cho nội dung giáo dục
-                                - **Echo**: Giọng nam trẻ, năng động, phù hợp cho quảng cáo
-                                - **Fable**: Giọng nam uy tín, phù hợp cho thông báo chính thức
-                                - **Onyx**: Giọng nam trầm, sang trọng, phù hợp cho thuyết trình
-                                - **Nova**: Giọng nữ chuyên nghiệp, phù hợp cho tin tức
-                                - **Sage**: Giọng nữ từng trải, ấm áp, phù hợp cho podcast
-                                - **Shimmer**: Giọng nữ tươi sáng, năng động, phù hợp cho giải trí
-                                - **Verse**: Giọng nam tự nhiên, cân bằng, phù hợp cho đa dạng nội dung
-                                """)
-                            
-                            with ai_examples_col:
-                                st.markdown("**Ví dụ về hướng dẫn giọng nói:**")
-                                st.markdown("""
-                                **Giọng diễn thuyết:**
-                                ```
-                                Tone: Đĩnh đạc, trang trọng, đầy tự tin
-                                Emotion: Nhiệt huyết, quyết đoán
-                                Delivery: Nhịp độ vừa phải với các ngắt quãng, nhấn mạnh từ khóa quan trọng
-                                ```
-                                
-                                **Giọng tư vấn:**
-                                ```
-                                Tone: Ấm áp, thân thiện, đáng tin cậy
-                                Emotion: Thấu hiểu, quan tâm
-                                Delivery: Nhẹ nhàng, rõ ràng, tạo cảm giác an tâm
-                                ```
-                                
-                                **Giọng quảng cáo:**
-                                ```
-                                Tone: Sôi nổi, cuốn hút, năng động
-                                Emotion: Phấn khích, hào hứng
-                                Delivery: Nhanh, đầy năng lượng, với cường độ tăng dần
-                                ```
-                                """)
+                            ai_tts_voice = st.selectbox(
+                                "Giọng đọc:",
+                                options=["Ash", "Ballad", "Coral", "Echo", "Fable", "Onyx", "Nova", "Sage", "Shimmer", "Verse"],
+                                index=8,
+                                key="ai_tts_voice"
+                            )
+                            ai_tts_speed = 1.2
+                            ai_tts_instructions = st.text_area(
+                                "Hướng dẫn giọng điệu:",
+                                value="Tone: Tự nhiên, trôi chảy\nEmotion: Nhiệt tình, tự tin\nDelivery: Rõ ràng, nhịp độ vừa phải",
+                                height=80,
+                                key="ai_tts_instructions"
+                            )
             
-            # Cài đặt AI model
-            with st.expander("Cài đặt mô hình AI", expanded=False):
+            # AI Model settings
+            with st.expander("🤖 Cài đặt mô hình AI", expanded=False):
                 ai_model = st.selectbox(
                     "Mô hình AI:",
                     options=["Mô hình mặc định", "Mô hình tối ưu hóa"],
@@ -1671,79 +1440,56 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                     "Chất lượng video AI:",
                     options=["low", "medium", "high"],
                     value="medium",
-                    key="ai_quality"
+                    key="ai_quality",
+                    format_func=lambda x: {"low": "Thấp", "medium": "Trung bình", "high": "Cao"}[x]
                 )
-                
-                ai_advanced = st.checkbox("Cài đặt nâng cao", value=False, key="ai_advanced")
-                if ai_advanced:
-                    ai_inference_steps = st.slider(
-                        "Số bước inference:",
-                        min_value=5,
-                        max_value=20,
-                        value=10,
-                        step=1,
-                        key="ai_inference_steps"
-                    )
             
-            # Tùy chỉnh khẩu hình AI (riêng biệt, không lồng trong expander khác)
+            # Tùy chỉnh khẩu hình AI
             with st.expander("🗣️ Tùy chỉnh khẩu hình", expanded=False):
-                # Điều chỉnh mức độ chuyển động môi
                 ai_vad_alpha = st.slider(
                     "Mức độ chuyển động môi:",
-                    min_value=0.0,
-                    max_value=1.0,
-                    value=1.0,
-                    step=0.05,
+                    min_value=0.0, max_value=1.0, value=1.0, step=0.05,
                     key="ai_vad_alpha",
-                    help="Giá trị thấp hơn sẽ làm giảm chuyển động môi, giá trị cao hơn sẽ tăng chuyển động"
+                    help="Giá trị thấp hơn sẽ làm giảm chuyển động môi"
                 )
                 
-                # Tùy chọn nâng cao
-                ai_mouth_advanced = st.checkbox("Tùy chọn nâng cao cho khẩu hình", value=False, key="ai_mouth_advanced")
+                ai_mouth_advanced = st.checkbox("Tùy chọn nâng cao", value=False, key="ai_mouth_advanced")
                 if ai_mouth_advanced:
-                    # Chọn các thành phần biểu cảm
                     ai_exp_components = st.multiselect(
                         "Thành phần biểu cảm:",
                         options=["exp", "pitch", "yaw", "roll", "t"],
                         default=["exp", "pitch", "yaw", "roll", "t"],
-                        key="ai_exp_components",
-                        help="Chọn các thành phần biểu cảm để sử dụng từ mô hình"
+                        key="ai_exp_components"
                     )
                     
-                    # Điều chỉnh tỷ lệ cho các thành phần
                     ai_exp_scale = st.slider(
-                        "Tỷ lệ biểu cảm miệng (exp):",
-                        min_value=0.5,
-                        max_value=1.5,
-                        value=1.0,
-                        step=0.1,
-                        key="ai_exp_scale",
-                        help="Điều chỉnh tỷ lệ biểu cảm miệng"
+                        "Tỷ lệ biểu cảm miệng:",
+                        min_value=0.5, max_value=1.5, value=1.0, step=0.1,
+                        key="ai_exp_scale"
                     )
                     
                     ai_pose_scale = st.slider(
-                        "Tỷ lệ chuyển động đầu (pitch, yaw, roll):",
-                        min_value=0.5,
-                        max_value=1.5,
-                        value=1.0,
-                        step=0.1,
-                        key="ai_pose_scale",
-                        help="Điều chỉnh tỷ lệ chuyển động đầu"
+                        "Tỷ lệ chuyển động đầu:",
+                        min_value=0.5, max_value=1.5, value=1.0, step=0.1,
+                        key="ai_pose_scale"
                     )
                     
-                    # Điều chỉnh offset biểu cảm môi
                     ai_delta_exp_enabled = st.checkbox("Thêm offset biểu cảm môi", value=False, key="ai_delta_exp_enabled")
+                    ai_delta_exp_value = 0.0
                     if ai_delta_exp_enabled:
                         ai_delta_exp_value = st.slider(
                             "Giá trị offset:",
-                            min_value=-0.2,
-                            max_value=0.2,
-                            value=0.0,
-                            step=0.01,
+                            min_value=-0.2, max_value=0.2, value=0.0, step=0.01,
                             key="ai_delta_exp_value"
                         )
+                else:
+                    ai_exp_components = None
+                    ai_exp_scale = 1.0
+                    ai_pose_scale = 1.0
+                    ai_delta_exp_enabled = False
+                    ai_delta_exp_value = 0.0
             
-            # Nút "Tạo Video Khuôn Mặt Nói"
+            # Submit button
             ai_submitted = st.button(
                 "🚀 Tạo Video Khuôn Mặt Nói",
                 use_container_width=True,
@@ -1751,9 +1497,8 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                 key="ai_create_button"
             )
         
-        # Cột hiển thị tiến trình và kết quả
         with ai_col2:
-            # Tạo các placeholder cho UI trạng thái
+            # Cột hiển thị tiến trình và kết quả
             ai_elapsed_time_container = st.empty()
             ai_status_container = st.empty()
             ai_progress_container = st.empty()
@@ -1764,15 +1509,13 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
             if st.session_state.processing:
                 ai_status_container.subheader("⏳ Đang xử lý...")
                 
-                # Hiển thị thời gian xử lý
                 if st.session_state.process_start_time:
                     elapsed = time.time() - st.session_state.process_start_time
                     ai_elapsed_time_container.caption(f"Thời gian xử lý: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}")
                 
                 progress = ai_progress_container.progress(0)
-                
-                # Nút hủy xử lý
                 cancel_button = ai_cancel_container.button("🛑 Hủy xử lý", key="ai_cancel_processing", use_container_width=True)
+                
             elif st.session_state.complete and st.session_state.output_file:
                 ai_status_container.subheader("✅ Đã hoàn thành!")
                 
@@ -1781,8 +1524,6 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                     ai_metrics_container.video(output_file)
                     
                     file_stats = Path(output_file).stat()
-                    
-                    # Hiển thị thông tin video
                     cols = ai_metrics_container.columns(2)
                     cols[0].metric("Kích thước", f"{file_stats.st_size / (1024*1024):.1f} MB")
                     cols[1].metric("Thời gian tạo", datetime.fromtimestamp(file_stats.st_mtime).strftime("%H:%M:%S"))
@@ -1797,15 +1538,14 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                             key="ai_download_button"
                         )
             else:
-                # Hiển thị trạng thái ban đầu
                 ai_status_container.subheader("Trạng thái")
                 ai_metrics_container.info("Nhấn nút 'Tạo Video Khuôn Mặt Nói' để bắt đầu xử lý...")
         
-        # Xử lý khi nhấn nút tạo video
+        # Xử lý khi nhấn nút tạo video AI
         if ai_submitted and not st.session_state.processing:
             # Xác định đường dẫn files
-            mc_path_final = ai_mc_file if ai_mc_file else ai_mc_path if 'ai_mc_path' in locals() and ai_mc_path else None
-            audio_path_final = ai_audio_file if ai_audio_file else ai_audio_path if 'ai_audio_path' in locals() and ai_audio_path else None
+            mc_path_final = ai_mc_file if ai_mc_file else (ai_mc_path if 'ai_mc_path' in locals() and ai_mc_path else None)
+            audio_path_final = ai_audio_file if ai_audio_file else (ai_audio_path if 'ai_audio_path' in locals() and ai_audio_path else None)
             
             if (mc_path_final and (audio_path_final or ai_text_prompt)):
                 # Chuẩn bị workflow chỉ cho talking head generation
@@ -1853,36 +1593,26 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                     target=process_video,
                     args=(
                         ai_workflow_steps,
-                        mc_path_final,
-                        None,
-                        audio_path_final,
-                        ai_text_prompt,
-                        temp_dir,
-                        msg_queue,
-                        cancel_event,
-                        editor,
-                        timestamp,
-                        tts_service_val,
-                        tts_voice_val,
-                        tts_speed_val,
+                        mc_path_final, None, audio_path_final, ai_text_prompt,
+                        temp_dir, msg_queue, cancel_event, editor, timestamp,
+                        tts_service_val, tts_voice_val, tts_speed_val,
                     ),
                     kwargs={
                         'tts_instructions_val': tts_instructions_val,
-                        'ai_model_val': ai_model,  # Truyền lựa chọn mô hình AI
+                        'ai_model_val': ai_model,
                         'quality_val': ai_quality,
-                        # Thêm các tham số khẩu hình
-                        'vad_alpha': ai_vad_alpha if 'ai_vad_alpha' in locals() else 1.0,
-                        'exp_components': ai_exp_components if 'ai_exp_components' in locals() and ai_mouth_advanced else None,
-                        'exp_scale': ai_exp_scale if 'ai_exp_scale' in locals() and ai_mouth_advanced else 1.0,
-                        'pose_scale': ai_pose_scale if 'ai_pose_scale' in locals() and ai_mouth_advanced else 1.0,
-                        'delta_exp_enabled': ai_delta_exp_enabled if 'ai_delta_exp_enabled' in locals() and ai_mouth_advanced else False,
-                        'delta_exp_value': ai_delta_exp_value if 'ai_delta_exp_value' in locals() and ai_delta_exp_enabled and ai_mouth_advanced else 0.0,
+                        'vad_alpha': ai_vad_alpha,
+                        'exp_components': ai_exp_components,
+                        'exp_scale': ai_exp_scale,
+                        'pose_scale': ai_pose_scale,
+                        'delta_exp_enabled': ai_delta_exp_enabled,
+                        'delta_exp_value': ai_delta_exp_value,
                     }
                 )
                 thread.daemon = True
                 thread.start()
                 
-                # UI theo dõi tiến trình (tương tự như tab chính)
+                # UI theo dõi tiến trình
                 try:
                     while thread.is_alive() or not msg_queue.empty():
                         # Cập nhật thời gian xử lý
@@ -1911,98 +1641,313 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                         except queue.Empty:
                             time.sleep(0.1)
                         
-                        # Thêm độ trễ để tránh quá tải UI
                         time.sleep(0.05)
                 except Exception as e:
                     st.error(f"Lỗi UI: {str(e)}")
                     st.session_state.processing = False
             else:
                 st.error("Vui lòng tải lên cả MC và audio (hoặc nhập văn bản)")
-
-    # === Tab 2: Quy Trình ===
+    
+    # === Tab 2: Text-to-Speech ===
     with tabs[2]:
-        st.subheader("⚙️ Cấu Hình Quy Trình")
+        st.subheader("🎙️ Text-to-Speech - Tạo giọng nói từ văn bản")
+        st.write("Tạo và nghe thử các giọng nói khác nhau từ văn bản")
         
-        st.write("Chọn các bước xử lý cần thực hiện. Các bước không được chọn sẽ bị bỏ qua trong quá trình xử lý.")
+        tts_col1, tts_col2 = st.columns([2, 1])
         
-        # Chia thành 2 cột để hiển thị checkbox
-        left_col, right_col = st.columns(2)
-        
-        # Đảm bảo workflow_steps có trong session state
-        workflow_steps_dict = {}
-        
-        # Hiển thị các checkbox trong hai cột để giao diện cân đối
-        steps = list(WORKFLOW_STEPS.items())
-        mid_idx = len(steps) // 2 + len(steps) % 2
-        
-        # Cột trái
-        with left_col:
-            for step_id, step_name in steps[:mid_idx]:
-                # Lấy giá trị hiện tại từ session state một cách an toàn
-                current_value = True
-                if 'workflow_steps' in st.session_state:
-                    if isinstance(st.session_state.workflow_steps, dict):
-                        current_value = st.session_state.workflow_steps.get(step_id, True)
+        with tts_col1:
+            # Text input
+            tts_text = st.text_area(
+                "📝 Nhập văn bản:",
+                height=150,
+                placeholder="Nhập nội dung bạn muốn chuyển thành giọng nói...",
+                key="tts_standalone_text"
+            )
+            
+            # Service selection
+            tts_service_standalone = st.selectbox(
+                "🔧 Dịch vụ TTS:",
+                options=["Edge TTS", "OpenAI TTS", "GPT-4o-mini-TTS"],
+                index=2,
+                key="tts_service_standalone"
+            )
+            
+            # Voice and settings based on service
+            if tts_service_standalone == "Edge TTS":
+                st.markdown("### 🎤 Cài đặt Edge TTS")
+                tts_voice_standalone = st.selectbox(
+                    "Giọng đọc:",
+                    options=["vi-VN-NamMinhNeural", "vi-VN-HoaiMyNeural"],
+                    key="tts_voice_standalone"
+                )
+                tts_speed_standalone = st.slider(
+                    "Tốc độ đọc:",
+                    min_value=0.8, max_value=1.5, value=1.2, step=0.1,
+                    key="tts_speed_standalone"
+                )
+                tts_instructions_standalone = ""
                 
-                workflow_steps_dict[step_id] = st.checkbox(
-                    step_name,
-                    value=current_value,
-                    key=f"workflow_{step_id}"
+                # Voice descriptions
+                voice_info = {
+                    "vi-VN-NamMinhNeural": "Giọng nam trẻ, rõ ràng, phù hợp cho nội dung chính thức",
+                    "vi-VN-HoaiMyNeural": "Giọng nữ ấm áp, thân thiện, phù hợp cho nội dung giáo dục"
+                }
+                st.caption(f"ℹ️ {voice_info[tts_voice_standalone]}")
+                
+            elif tts_service_standalone == "OpenAI TTS":
+                st.markdown("### 🎤 Cài đặt OpenAI TTS")
+                tts_voice_standalone = st.selectbox(
+                    "Giọng đọc:",
+                    options=["alloy", "echo", "fable", "onyx", "nova", "shimmer"],
+                    key="tts_voice_standalone"
+                )
+                tts_speed_standalone = st.slider(
+                    "Tốc độ đọc:",
+                    min_value=0.8, max_value=1.5, value=1.2, step=0.1,
+                    key="tts_speed_standalone"
+                )
+                tts_instructions_standalone = ""
+                
+                # Voice descriptions for OpenAI
+                openai_voice_info = {
+                    "alloy": "Giọng trung tính, cân bằng",
+                    "echo": "Giọng nam trẻ",
+                    "fable": "Giọng nam trưởng thành",
+                    "onyx": "Giọng nam trầm",
+                    "nova": "Giọng nữ trẻ",
+                    "shimmer": "Giọng nữ tươi sáng"
+                }
+                st.caption(f"ℹ️ {openai_voice_info[tts_voice_standalone]}")
+                
+            else:  # GPT-4o-mini-TTS
+                st.markdown("### 🎤 Cài đặt GPT-4o-mini-TTS")
+                tts_voice_standalone = st.selectbox(
+                    "Giọng đọc:",
+                    options=["Ash", "Ballad", "Coral", "Echo", "Fable", "Onyx", "Nova", "Sage", "Shimmer", "Verse"],
+                    index=8,  # Shimmer
+                    key="tts_voice_standalone"
+                )
+                
+                # Hiển thị mô tả giọng nói
+                st.caption(f"ℹ️ **{tts_voice_standalone}**: {VOICE_DESCRIPTIONS.get(tts_voice_standalone, '')}")
+                
+                tts_speed_standalone = 1.2  # Fixed for GPT-4o
+                
+                tts_instructions_standalone = st.text_area(
+                    "🎭 Hướng dẫn về giọng điệu:",
+                    value="Tone: Tự nhiên, trôi chảy, chuyên nghiệp\nEmotion: Nhiệt tình, tự tin\nDelivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan trọng",
+                    height=120,
+                    key="tts_instructions_standalone",
+                    help="Mô tả tông giọng, cảm xúc và cách truyền đạt mong muốn"
+                )
+                
+                # Instruction templates
+                with st.expander("📋 Mẫu hướng dẫn giọng điệu", expanded=False):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.markdown("**🎤 Giọng diễn thuyết:**")
+                        if st.button("Sử dụng", key="preset_speech"):
+                            st.session_state.tts_instructions_standalone = "Tone: Đĩnh đạc, trang trọng, đầy tự tin\nEmotion: Nhiệt huyết, quyết đoán\nDelivery: Nhịp độ vừa phải với các ngắt quãng, nhấn mạnh từ khóa quan trọng"
+                            st.rerun()
+                        
+                        st.markdown("**💼 Giọng thuyết trình:**")
+                        if st.button("Sử dụng", key="preset_presentation"):
+                            st.session_state.tts_instructions_standalone = "Tone: Chuyên nghiệp, rõ ràng, tự tin\nEmotion: Tập trung, nghiêm túc\nDelivery: Nhịp độ đều đặn, phát âm rõ ràng từng từ"
+                            st.rerun()
+                    
+                    with col2:
+                        st.markdown("**🤝 Giọng tư vấn:**")
+                        if st.button("Sử dụng", key="preset_consulting"):
+                            st.session_state.tts_instructions_standalone = "Tone: Ấm áp, thân thiện, đáng tin cậy\nEmotion: Thấu hiểu, quan tâm\nDelivery: Nhẹ nhàng, rõ ràng, tạo cảm giác an tâm"
+                            st.rerun()
+                        
+                        st.markdown("**📺 Giọng quảng cáo:**")
+                        if st.button("Sử dụng", key="preset_ads"):
+                            st.session_state.tts_instructions_standalone = "Tone: Sôi nổi, cuốn hút, năng động\nEmotion: Phấn khích, hào hứng\nDelivery: Nhanh, đầy năng lượng, với cường độ tăng dần"
+                            st.rerun()
+            
+            # Action buttons
+            col_preview, col_download = st.columns(2)
+            
+            with col_preview:
+                preview_button = st.button(
+                    "🔊 Nghe thử giọng nói",
+                    use_container_width=True,
+                    disabled=not tts_text.strip()
+                )
+            
+            with col_download:
+                generate_button = st.button(
+                    "💾 Tạo và tải xuống",
+                    use_container_width=True,
+                    type="primary",
+                    disabled=not tts_text.strip()
                 )
         
-        # Cột phải
-        with right_col:
-            for step_id, step_name in steps[mid_idx:]:
-                # Lấy giá trị hiện tại từ session state một cách an toàn
-                current_value = True
-                if 'workflow_steps' in st.session_state:
-                    if isinstance(st.session_state.workflow_steps, dict):
-                        current_value = st.session_state.workflow_steps.get(step_id, True)
+        with tts_col2:
+            st.subheader("🎵 Kết quả")
+            
+            # Preview area
+            preview_message = st.empty()
+            preview_audio = st.empty()
+            
+            # Handle preview button
+            if preview_button and tts_text.strip():
+                preview_message.info("⏳ Đang tạo mẫu giọng nói...")
                 
-                workflow_steps_dict[step_id] = st.checkbox(
-                    step_name,
-                    value=current_value,
-                    key=f"workflow_{step_id}"
-                )
-        
-        # Cập nhật workflow_steps trong session state
-        st.session_state.workflow_steps = workflow_steps_dict
-        
-        # Thêm mô tả chi tiết
-        with st.expander("ℹ️ Chi tiết các bước xử lý", expanded=False):
-            st.markdown("""
-            **Mô tả chi tiết từng bước:**
+                if tts_service_standalone == "GPT-4o-mini-TTS" and openai_client:
+                    try:
+                        # Use asyncio for GPT-4o preview
+                        audio_bytes = asyncio.run(preview_audio_tts(
+                            tts_text[:200],  # Limit preview length
+                            tts_instructions_standalone,
+                            tts_voice_standalone,
+                            preview_message
+                        ))
+                        
+                        if audio_bytes:
+                            preview_message.success("✅ Tạo mẫu giọng nói thành công!")
+                            preview_audio.audio(audio_bytes, format="audio/mp3")
+                    except Exception as e:
+                        preview_message.error(f"Lỗi: {str(e)}")
+                        
+                else:
+                    try:
+                        # Use VideoEditor for other services
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
+                            temp_path = temp.name
+                        
+                        tts_service = "edge" if tts_service_standalone == "Edge TTS" else "openai"
+                        success, error = editor.generate_audio_from_text(
+                            tts_text[:200],  # Limit preview length
+                            temp_path,
+                            service=tts_service,
+                            voice=tts_voice_standalone,
+                            speed=tts_speed_standalone
+                        )
+                        
+                        if success and os.path.exists(temp_path):
+                            preview_message.success("✅ Tạo mẫu giọng nói thành công!")
+                            with open(temp_path, "rb") as f:
+                                audio_bytes = f.read()
+                            preview_audio.audio(audio_bytes, format="audio/mp3")
+                            os.unlink(temp_path)
+                        else:
+                            preview_message.error(f"Lỗi: {error}")
+                            
+                    except Exception as e:
+                        preview_message.error(f"Lỗi: {str(e)}")
             
-            **Chuẩn bị files**: Chuẩn bị và sao chép các file đầu vào để xử lý
+            # Handle generate and download
+            if generate_button and tts_text.strip():
+                with st.spinner("⏳ Đang tạo file audio..."):
+                    try:
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        
+                        if tts_service_standalone == "GPT-4o-mini-TTS" and openai_client:
+                            # Generate with GPT-4o-mini-TTS
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
+                                temp_path = temp.name
+                            
+                            success = asyncio.run(generate_gpt4o_tts(
+                                tts_text,
+                                temp_path,
+                                tts_instructions_standalone,
+                                tts_voice_standalone
+                            ))
+                            
+                            if success and os.path.exists(temp_path):
+                                with open(temp_path, "rb") as f:
+                                    audio_bytes = f.read()
+                                
+                                st.download_button(
+                                    "💾 Tải xuống audio",
+                                    audio_bytes,
+                                    file_name=f"tts_gpt4o_{timestamp}.mp3",
+                                    mime="audio/mp3",
+                                    use_container_width=True
+                                )
+                                
+                                st.audio(audio_bytes, format="audio/mp3")
+                                os.unlink(temp_path)
+                            else:
+                                st.error("Lỗi khi tạo audio với GPT-4o-mini-TTS")
+                                
+                        else:
+                            # Generate with other services
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
+                                temp_path = temp.name
+                            
+                            tts_service = "edge" if tts_service_standalone == "Edge TTS" else "openai"
+                            success, error = editor.generate_audio_from_text(
+                                tts_text,
+                                temp_path,
+                                service=tts_service,
+                                voice=tts_voice_standalone,
+                                speed=tts_speed_standalone
+                            )
+                            
+                            if success and os.path.exists(temp_path):
+                                with open(temp_path, "rb") as f:
+                                    audio_bytes = f.read()
+                                
+                                st.download_button(
+                                    "💾 Tải xuống audio",
+                                    audio_bytes,
+                                    file_name=f"tts_{tts_service}_{timestamp}.mp3",
+                                    mime="audio/mp3",
+                                    use_container_width=True
+                                )
+                                
+                                st.audio(audio_bytes, format="audio/mp3")
+                                os.unlink(temp_path)
+                            else:
+                                st.error(f"Lỗi: {error}")
+                                
+                    except Exception as e:
+                        st.error(f"Lỗi khi tạo audio: {str(e)}")
             
-            **Tạo âm thanh từ văn bản**: Sử dụng công nghệ TTS để tạo âm thanh từ văn bản nhập vào
-            
-            **Tạo phụ đề từ audio**: Phân tích audio và tạo file phụ đề (.srt)
-            
-            **Tạo video khuôn mặt nói**: Sử dụng AI để tạo hiệu ứng nói cho MC dựa trên audio
-            
-            **Ghép video MC và nền**: Ghép video MC đã tạo vào video nền với vị trí đã chọn
-            
-            **Thêm phụ đề vào video**: Áp dụng phụ đề vào video cuối cùng với hiệu ứng đã chọn
-            """)
-        
-        # Nút reset tất cả các bước
-        if st.button("↩️ Khôi phục tất cả bước", use_container_width=True):
-            st.session_state.workflow_steps = {k: True for k in WORKFLOW_STEPS}
-            st.rerun()
-        
-        # Hiển thị thông tin về các điều kiện phụ thuộc
-        st.info("**Lưu ý:** Một số bước phụ thuộc vào các bước trước đó. Khi bỏ qua một bước, hệ thống sẽ tự động dùng dữ liệu mẫu hoặc kết quả có sẵn.")
-
-    # === Tab 3: Lịch Sử ===
+            # TTS Info
+            st.markdown("---")
+            st.markdown("### 📊 Thông tin TTS")
+            if tts_service_standalone == "GPT-4o-mini-TTS":
+                st.info("🎭 **GPT-4o-mini-TTS**: Giọng nói biểu cảm với AI")
+                st.markdown("""
+                **Tính năng:**
+                - ✅ 10 giọng nói đa dạng
+                - ✅ Tùy chỉnh giọng điệu
+                - ✅ Biểu cảm tự nhiên
+                - ✅ Chất lượng cao
+                """)
+            elif tts_service_standalone == "Edge TTS":
+                st.info("🎤 **Edge TTS**: Miễn phí, chất lượng tốt")
+                st.markdown("""
+                **Tính năng:**
+                - ✅ Miễn phí hoàn toàn
+                - ✅ Hỗ trợ tiếng Việt
+                - ✅ Điều chỉnh tốc độ
+                - ✅ Chất lượng ổn định
+                """)
+            else:
+                st.info("🤖 **OpenAI TTS**: Chất lượng cao, đa ngôn ngữ")
+                st.markdown("""
+                **Tính năng:**
+                - ✅ Chất lượng premium
+                - ✅ 6 giọng nói khác nhau
+                - ✅ Hỗ trợ nhiều ngôn ngữ
+                - ✅ Điều chỉnh tốc độ
+                """)
+    
+    # === Tab 3: Lịch sử ===
     with tabs[3]:
-        st.subheader("Lịch sử video đã tạo")
+        st.subheader("📋 Lịch sử video đã tạo")
         
         # Cập nhật lịch sử từ thư mục
         update_history_from_folder()
         
         if not st.session_state.history:
-            st.info("Chưa có video nào được tạo.")
+            st.info("📝 Chưa có video nào được tạo.")
         else:
             # Tùy chọn sắp xếp và tìm kiếm
             col1, col2 = st.columns(2)
@@ -2012,7 +1957,7 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                     ["Thời gian tạo (mới nhất)", "Thời gian tạo (cũ nhất)", "Kích thước (lớn nhất)", "Kích thước (nhỏ nhất)"],
                     index=0
                 )
-                
+            
             with col2:
                 search_term = st.text_input("Tìm kiếm:", placeholder="Nhập tên file...")
             
@@ -2040,246 +1985,143 @@ Delivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan tr
                         st.video(str(file_path))
                     
                     with col2:
-                        st.write(f"Kích thước: {item['size']:.1f} MB")
-                        st.write(f"Thời gian tạo: {item['created'].strftime('%Y-%m-%d %H:%M:%S')}")
-                    
-                    buttons_col1, buttons_col2 = st.columns(2)
-                    with buttons_col1:
-                        with open(file_path, "rb") as f:
-                            st.download_button(
-                                "💾 Tải xuống",
-                                f,
-                                file_name=file_path.name,
-                                mime="video/mp4",
-                                key=f"download_{file_path.name}",
-                                use_container_width=True
-                            )
-                    
-                    with buttons_col2:
-                        if st.button("🗑️ Xóa video", key=f"delete_{file_path.name}", use_container_width=True):
-                            try:
-                                file_path.unlink()
-                                st.session_state.history = [h for h in st.session_state.history if h['path'] != str(file_path)]
-                                st.success(f"Đã xóa {file_path.name}")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Không thể xóa file: {str(e)}")
-
-        # === Tab 4: Hướng Dẫn ===
+                        st.write(f"**Kích thước:** {item['size']:.1f} MB")
+                        st.write(f"**Thời gian tạo:** {item['created'].strftime('%Y-%m-%d %H:%M:%S')}")
+                        
+                        buttons_col1, buttons_col2 = st.columns(2)
+                        with buttons_col1:
+                            with open(file_path, "rb") as f:
+                                st.download_button(
+                                    "💾 Tải xuống",
+                                    f,
+                                    file_name=file_path.name,
+                                    mime="video/mp4",
+                                    key=f"download_{file_path.name}",
+                                    use_container_width=True
+                                )
+                        
+                        with buttons_col2:
+                            if st.button("🗑️ Xóa video", key=f"delete_{file_path.name}", use_container_width=True):
+                                try:
+                                    file_path.unlink()
+                                    st.session_state.history = [h for h in st.session_state.history if h['path'] != str(file_path)]
+                                    st.success(f"Đã xóa {file_path.name}")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Không thể xóa file: {str(e)}")
+    
+    # === Tab 4: Hướng dẫn ===
     with tabs[4]:
-        st.subheader("Hướng dẫn sử dụng")
+        st.subheader("❓ Hướng dẫn sử dụng")
         
-        # Các phần hướng dẫn
         with st.expander("🚀 Bắt đầu nhanh", expanded=True):
             st.markdown("""
-            **Các bước cơ bản để tạo video MC:**
+            ### 🎬 Tạo Video MC:
+            1. **📁 Tải lên file MC**: Ảnh hoặc video có nhân vật nói
+            2. **🎞️ Tải lên video nền**: Video nền cho MC
+            3. **🎵 Chọn nguồn audio**: Tải lên file audio hoặc tạo từ văn bản
+            4. **⚙️ Điều chỉnh cài đặt**: Vị trí và kích thước MC
+            5. **🚀 Nhấn "Tạo Video MC"**: Chờ xử lý và tải xuống kết quả
             
-            - 1. **Tải lên hoặc chọn file MC**
-              - Hình ảnh hoặc video có nhân vật nói
-            - 2. **Tải lên hoặc chọn video nền**
-              - Video nền cho MC
-            - 3. **Chọn nguồn audio**
-              - Tải lên file audio hoặc tạo mới từ văn bản
-            - 4. **Điều chỉnh cài đặt MC**
-              - Vị trí và kích thước MC trên video
-            - 5. **Điều chỉnh cài đặt phụ đề**
-              - Chọn kiểu và kích thước phụ đề
-            - 6. **Nhấn nút "Tạo Video"**
-              - Chờ xử lý và tải xuống kết quả
+            ### 🎭 Tạo Video Khuôn Mặt AI:
+            1. **📁 Tải lên file MC**: Ảnh hoặc video khuôn mặt
+            2. **🎵 Chọn nguồn audio**: Audio hoặc văn bản
+            3. **🤖 Chọn mô hình AI**: Mặc định hoặc tối ưu hóa
+            4. **🗣️ Tùy chỉnh khẩu hình**: Điều chỉnh chuyển động môi
+            5. **🚀 Nhấn "Tạo Video Khuôn Mặt Nói"**: Chờ kết quả
             """)
         
-        with st.expander("⚙️ Các tính năng nâng cao", expanded=False):
+        with st.expander("🎙️ Text-to-Speech", expanded=False):
             st.markdown("""
-            **Tính năng tự động hóa:**
-            - Tự động điều chỉnh kích thước MC dựa trên tỷ lệ video nền
-            - Tự động điều chỉnh kích thước phụ đề phù hợp với độ phân giải
+            ### Dịch vụ TTS có sẵn:
             
-            **Kiểu phụ đề:**
-            - Style 01: Hiển thị từng từ một với màu sắc thay đổi
-            - Style 02: Phụ đề có hiệu ứng màu gradient và zoom nhẹ
+            **🤖 GPT-4o-mini-TTS** (Khuyến nghị):
+            - 10 giọng nói đa dạng
+            - Tùy chỉnh giọng điệu chi tiết
+            - Biểu cảm tự nhiên
             
-            **Cấu hình quy trình:**
-            - Chọn các bước cụ thể để tùy chỉnh quy trình xử lý
-            - Bỏ qua các bước không cần thiết để tiết kiệm thời gian
+            **🎤 Edge TTS** (Miễn phí):
+            - Hỗ trợ tiếng Việt tốt
+            - Không cần API key
+            - Chất lượng ổn định
             
-            **Video Khuôn Mặt AI:**
-            - Sử dụng tab chuyên biệt để tạo video khuôn mặt nói mà không cần video nền
-            - Chọn giữa mô hình mặc định và mô hình tối ưu hóa để đạt kết quả tốt nhất
-            
-            **GPT-4o-mini-TTS:**
-            - Tạo âm thanh với cảm xúc và giọng điệu phong phú
-            - Chọn từ 10 giọng đọc khác nhau (Ash, Ballad, Coral, Echo, Fable, Onyx, Nova, Sage, Shimmer, Verse)
-            - Tùy chỉnh hướng dẫn về tông giọng, cảm xúc và cách truyền đạt
-            - Nghe thử trước khi tạo video để đảm bảo chất lượng
-            
-            **Điều chỉnh khẩu hình miệng:**
-            - Điều chỉnh mức độ chuyển động môi theo âm thanh
-            - Tùy chỉnh thành phần biểu cảm và tỷ lệ áp dụng
-            - Thêm offset biểu cảm môi để điều chỉnh hình dáng miệng
+            **🔊 OpenAI TTS** (Premium):
+            - Chất lượng cao
+            - 6 giọng nói khác nhau
+            - Cần API key
             """)
         
-        with st.expander("🔍 Xử lý sự cố", expanded=False):
+        with st.expander("⚙️ Tính năng nâng cao", expanded=False):
             st.markdown("""
-            **Vấn đề thường gặp:**
-            1. **Xử lý chậm:** Giảm kích thước/độ phân giải file đầu vào
-            2. **Lỗi khi xử lý video:** Kiểm tra định dạng file
-            3. **Phụ đề không đồng bộ:** Kiểm tra audio có rõ ràng không
+            ### 🗣️ Điều khiển khẩu hình:
+            - **Mức độ chuyển động môi**: Điều chỉnh độ mạnh của chuyển động môi
+            - **Thành phần biểu cảm**: Chọn các phần của khuôn mặt để animate
+            - **Tỷ lệ biểu cảm**: Điều chỉnh cường độ biểu cảm
+            - **Offset biểu cảm**: Thay đổi hình dáng môi mặc định
             
-            **Nếu gặp lỗi:**
-            - Xem logs để biết chi tiết
-            - Thử sử dụng file mẫu để xác định vấn đề
+            ### 🎛️ Cài đặt video:
+            - **Vị trí MC**: 5 vị trí khác nhau trên video
+            - **Tự động scale**: Tính toán kích thước phù hợp
+            - **Chất lượng**: Low/Medium/High
+            - **Mô hình AI**: Mặc định hoặc tối ưu hóa
+            
+            ### 🔄 Quy trình xử lý:
+            - Bật/tắt từng bước xử lý
+            - Tùy chỉnh workflow theo nhu cầu
+            - Theo dõi tiến trình real-time
             """)
-
-    # === Xử lý khi submit ===
-    if submitted and not st.session_state.processing:
-        # Xác định đường dẫn các files
-        mc_path_final = mc_file if mc_file else mc_path if 'mc_path' in locals() and mc_path else None
-        bg_path_final = bg_file if bg_file else bg_path if 'bg_path' in locals() and bg_path else None
-        audio_path_final = audio_file if audio_file else audio_path if 'audio_path' in locals() and audio_path else None
         
-        # Lấy workflow_steps từ session_state
-        if 'workflow_steps' not in st.session_state:
-            workflow_steps = {k: True for k in WORKFLOW_STEPS}
-        else:
-            workflow_steps = st.session_state.workflow_steps.copy() if isinstance(st.session_state.workflow_steps, dict) else {k: True for k in WORKFLOW_STEPS}
+        with st.expander("🔧 Xử lý sự cố", expanded=False):
+            st.markdown("""
+            ### ❌ Vấn đề thường gặp:
+            
+            **🐌 Xử lý chậm:**
+            - Giảm chất lượng xuống "Low"
+            - Sử dụng file input nhỏ hơn
+            - Kiểm tra GPU memory
+            
+            **❌ Lỗi khi tạo video:**
+            - Kiểm tra định dạng file đúng
+            - Đảm bảo files không bị lỗi
+            - Thử restart runtime
+            
+            **❌ Lỗi TTS:**
+            - Kiểm tra API keys (nếu dùng OpenAI)
+            - Thử dịch vụ Edge TTS
+            - Kiểm tra kết nối internet
+            
+            **🔄 App bị đơ:**
+            - Nhấn nút "Hủy xử lý"
+            - Restart Streamlit
+            - Kiểm tra logs để debug
+            """)
         
-        if ((mc_path_final and bg_path_final) and (audio_path_final or text_prompt)):
-            st.session_state.processing = True
-            st.session_state.process_start_time = time.time()
-            st.session_state.logs = ["Bắt đầu quá trình xử lý..."]
+        with st.expander("💡 Mẹo tối ưu", expanded=False):
+            st.markdown("""
+            ### 📸 Chuẩn bị file MC:
+            - Khuôn mặt rõ ràng, nhìn thẳng
+            - Nền đồng màu hoặc trong suốt
+            - Ánh sáng đều, không bị tối
+            - Độ phân giải ít nhất 512x512
             
-            # Cập nhật UI trạng thái ban đầu
-            status_container.subheader("⏳ Đang xử lý...")
-            elapsed = time.time() - st.session_state.process_start_time
-            elapsed_time_container.caption(f"Thời gian xử lý: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}")
-            progress = progress_container.progress(0)
-            cancel_button = cancel_container.button("🛑 Hủy xử lý", key="cancel_processing", use_container_width=True)
-            if show_logs:
-                log_container.markdown("**Logs:**")
-                log_content = log_container.code("Đang bắt đầu...")
+            ### 🎞️ Video nền:
+            - Định dạng MP4, tỷ lệ 16:9
+            - Độ phân giải HD (1280x720) trở lên
+            - Thời lượng phù hợp với audio
+            - Nội dung phù hợp với chủ đề
             
-            # Tạo tempdir và đường dẫn
-            temp_dir = Path(tempfile.mkdtemp())
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            ### 🎵 Audio chất lượng:
+            - File WAV hoặc MP3
+            - Không có tiếng ồn nền
+            - Giọng nói rõ ràng
+            - Tốc độ nói vừa phải
             
-            # Chuẩn bị hàng đợi giao tiếp
-            msg_queue = queue.Queue()
-            
-            # Sử dụng threading.Event thay vì truy cập st.session_state từ luồng phụ
-            cancel_event = threading.Event()
-            
-            # Chuẩn bị containers cho handler
-            ui_containers = {
-                'status': status_container,
-                'progress': progress,
-                'log_content': log_content if show_logs else None,
-                'metrics': metrics_container
-            }
-            
-            # Chuẩn bị dữ liệu để truyền cho thread
-            # Trích xuất các giá trị cần thiết từ UI để truyền vào thread
-            tts_service_val = tts_service if audio_source == "Tạo từ văn bản" else "Edge TTS"
-            tts_voice_val = tts_voice if audio_source == "Tạo từ văn bản" else "vi-VN-NamMinhNeural"
-            tts_speed_val = tts_speed if audio_source == "Tạo từ văn bản" and tts_service != "GPT-4o-mini-TTS" else 1.2
-            tts_instructions_val = tts_instructions if audio_source == "Tạo từ văn bản" and tts_service == "GPT-4o-mini-TTS" else ""
-            caption_style_val = caption_style
-            fontsize_val = fontsize
-            caption_position_val = caption_position
-            caption_zoom_val = caption_zoom
-            zoom_size_val = zoom_size
-            quality_val = quality
-            
-            # Khởi chạy thread xử lý với tham số là dictionary workflow_steps
-            thread = threading.Thread(
-                target=process_video,
-                args=(
-                    workflow_steps,
-                    mc_path_final,
-                    bg_path_final,
-                    audio_path_final,
-                    text_prompt,
-                    temp_dir,
-                    msg_queue,
-                    cancel_event,
-                    editor,
-                    timestamp,
-                    tts_service_val,
-                    tts_voice_val,
-                    tts_speed_val,
-                ),
-                kwargs={
-                    'tts_instructions_val': tts_instructions_val,
-                    'position_val': position,
-                    'scale_val': scale,
-                    'caption_style_val': caption_style_val,
-                    'fontsize_val': fontsize_val,
-                    'caption_position_val': caption_position_val,
-                    'caption_zoom_val': caption_zoom_val,
-                    'zoom_size_val': zoom_size_val,
-                    'quality_val': quality_val,
-                    'ai_model_val': "Mô hình mặc định",  # Mặc định cho tab chính
-                    # Thêm các tham số khẩu hình
-                    'vad_alpha': vad_alpha if 'vad_alpha' in locals() else 1.0,
-                    'exp_components': exp_components if 'exp_components' in locals() and mouth_advanced else None,
-                    'exp_scale': exp_scale if 'exp_scale' in locals() and mouth_advanced else 1.0,
-                    'pose_scale': pose_scale if 'pose_scale' in locals() and mouth_advanced else 1.0,
-                    'delta_exp_enabled': delta_exp_enabled if 'delta_exp_enabled' in locals() and mouth_advanced else False,
-                    'delta_exp_value': delta_exp_value if 'delta_exp_value' in locals() and delta_exp_enabled and mouth_advanced else 0.0,
-                }
-            )
-            thread.daemon = True
-            thread.start()
-            
-            # UI theo dõi tiến trình
-            try:
-                while thread.is_alive() or not msg_queue.empty():
-                    # Cập nhật thời gian xử lý
-                    if st.session_state.process_start_time:
-                        elapsed = time.time() - st.session_state.process_start_time
-                        elapsed_time_container.caption(f"Thời gian xử lý: {int(elapsed // 60):02d}:{int(elapsed % 60):02d}")
-                    
-                    # Kiểm tra nếu đã nhấn nút hủy
-                    if cancel_button:
-                        cancel_event.set()
-                        st.session_state.processing = False
-                        st.warning("Đã hủy quá trình xử lý")
-                        break
-                    
-                    # Xử lý thông điệp
-                    try:
-                        msg_type, content = msg_queue.get(timeout=0.1)
-                        handle_message(msg_type, content, ui_containers, show_logs)
-                        msg_queue.task_done()
-                        
-                        if msg_type == 'complete':
-                            time.sleep(0.5)  # Đợi UI cập nhật trước khi rerun
-                            st.rerun()
-                    except queue.Empty:
-                        time.sleep(0.1)
-                    
-                    # Thêm độ trễ để tránh quá tải UI
-                    time.sleep(0.05)
-                
-                # Nếu thread vẫn chạy nhưng vòng lặp kết thúc
-                if thread.is_alive():
-                    st.warning("Tiến trình xử lý vẫn đang chạy nền...")
-                
-            except Exception as e:
-                error_details = traceback.format_exc()
-                st.error(f"Lỗi UI: {str(e)}\n{error_details}")
-                st.session_state.processing = False
-        else:
-            st.error("Vui lòng chọn đầy đủ: MC, video nền, và audio (hoặc nhập văn bản)")
-
-    # Thêm footer với thông tin aiclip.ai
-    # st.markdown("---")
-    # st.markdown(
-    #     "<div style='text-align: center;'>"
-    #     "Copyright © 2025 "
-    #     "<a href='https://aiclip.ai' target='_blank'>aiclip.ai</a>"
-    #     "</div>",
-    #     unsafe_allow_html=True
-    # )
+            ### ⚡ Tối ưu hiệu suất:
+            - Sử dụng GPU T4 hoặc cao hơn
+            - Đóng các tab không cần thiết
+            - Kiểm tra RAM còn trống
+            - Sử dụng chất lượng Medium cho cân bằng
+            """)
 
 if __name__ == "__main__":
     main()
