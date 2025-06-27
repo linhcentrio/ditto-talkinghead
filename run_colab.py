@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-🎭 Ditto Talking Head - Complete Setup for Google Colab
+🎭 AI video creator - Complete Setup for Google Colab
 Tối ưu hóa: Chỉ tải từ HuggingFace Hub
 """
 
@@ -200,8 +200,8 @@ import streamlit as st
 import sys, os
 sys.path.insert(0, os.getcwd())
 
-st.set_page_config(page_title="🎭 Ditto Talking Head", page_icon="🎭", layout="wide")
-st.title("🎭 Ditto Talking Head")
+st.set_page_config(page_title="🎭 AI video creator", page_icon="🎭", layout="wide")
+st.title("🎭 AI video creator")
 st.markdown("### AI-Powered Talking Head Video Generator")
 
 try:
@@ -287,7 +287,7 @@ st.markdown("- [Ngrok Dashboard](https://dashboard.ngrok.com/)")
             public_url = str(self.ngrok_tunnel.public_url)
             
             print("\n" + "=" * 70)
-            print("🎉 DITTO TALKING HEAD ĐÃ KHỞI ĐỘNG THÀNH CÔNG!")
+            print("🎉 AI video creator ĐÃ KHỞI ĐỘNG THÀNH CÔNG!")
             print("=" * 70)
             print(f"🔗 Public URL: {public_url}")
             print(f"📱 Truy cập ứng dụng tại: {public_url}")
@@ -324,7 +324,7 @@ st.markdown("- [Ngrok Dashboard](https://dashboard.ngrok.com/)")
 
     def run_setup(self):
         """Chạy toàn bộ setup"""
-        print("🎭 Ditto Talking Head - Complete Setup")
+        print("🎭 AI video creator - Complete Setup")
         print("=" * 50)
         
         steps = [
