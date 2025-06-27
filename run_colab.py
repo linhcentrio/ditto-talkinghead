@@ -212,16 +212,78 @@ class DittoSimpleSetup:
             self.data_root = "./checkpoints/ditto_trt"
             os.makedirs(self.data_root, exist_ok=True)
             
-            # Tải models từ Google Drive
-            self.run_command_silent(
-                f"gdown --folder https://drive.google.com/drive/folders/{GDRIVE_TRT_MODELS} -O {self.data_root} > /dev/null 2>&1",
-                timeout=600
-            )
+            # Ưu tiên tải từ Hugging Face trước
+            print("   → Thử tải models từ Hugging Face...")
+            hf_success = self.download_from_huggingface()
+            
+            if not hf_success:
+                print("   → Hugging Face thất bại, chuyển sang Google Drive...")
+                # Fallback về Google Drive
+                self.run_command_silent(
+                    f"gdown --folder https://drive.google.com/drive/folders/{GDRIVE_TRT_MODELS} -O {self.data_root} > /dev/null 2>&1",
+                    timeout=600
+                )
         else:
             self.data_root = "./checkpoints/ditto_trt_Ampere_Plus"
             os.makedirs(self.data_root, exist_ok=True)
             
         return True
+    
+    def download_from_huggingface(self):
+        """Tải models từ Hugging Face với huggingface_hub"""
+        try:
+            # Cài đặt huggingface_hub nếu chưa có
+            install_result = self.run_command_silent(
+                "pip install huggingface_hub > /dev/null 2>&1", 
+                timeout=120
+            )
+            
+            if not install_result:
+                return False
+            
+            # Import huggingface_hub
+            from huggingface_hub import hf_hub_download
+            
+            # Danh sách các model files cần tải
+            model_files = [
+                "appearance_extractor_fp16.engine",
+                "blaze_face_fp16.engine", 
+                "decoder_fp16.engine",
+                "face_mesh_fp16.engine",
+                "hubert_fp32.engine",
+                "insightface_det_fp16.engine",
+                "landmark106_fp16.engine",
+                "landmark203_fp16.engine",
+                "lmdm_v0.4_hubert_fp32.engine",
+                "motion_extractor_fp32.engine",
+                "stitch_network_fp16.engine",
+                "warp_network_fp16.engine"
+            ]
+            
+            # Tải từng file
+            for model_file in model_files:
+                try:
+                    downloaded_path = hf_hub_download(
+                        repo_id="manh-linh/ditto_trt_custom",
+                        filename=model_file,
+                        cache_dir=self.data_root,
+                        local_dir=self.data_root,
+                        local_dir_use_symlinks=False
+                    )
+                    print(f"   ✓ Đã tải: {model_file}")
+                except Exception as e:
+                    print(f"   ✗ Lỗi tải {model_file}: {str(e)}")
+                    return False
+            
+            print("   ✅ Tải hoàn tất từ Hugging Face!")
+            return True
+            
+        except ImportError:
+            print("   ✗ Không thể import huggingface_hub")
+            return False
+        except Exception as e:
+            print(f"   ✗ Lỗi tải từ Hugging Face: {str(e)}")
+            return False
     
     def test_ai_core(self):
         """Test AI Core SDK"""

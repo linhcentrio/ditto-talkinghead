@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Streamlit UI tối ưu cho Google Colab - Ditto Talking Head
+"""Streamlit UI tối ưu cho Google Colab - AI Video Creator
 Bao gồm tất cả tính năng nâng cao trừ subtitle
 """
 
@@ -846,7 +846,7 @@ def process_video(workflow_dict, mc_path_final, bg_path_final, audio_path_final,
 def main():
     # Cấu hình trang
     st.set_page_config(
-        page_title="🎭 Ditto Talking Head",
+        page_title="🎭 AI Video Creator",
         page_icon="🎭",
         layout="wide"
     )
@@ -858,7 +858,7 @@ def main():
     config = get_colab_config()
     
     # Header
-    st.title("🎭 Ditto Talking Head")
+    st.title("🎭 AI Video Creator")
     st.caption("Tạo video khuôn mặt nói với AI - Phiên bản Google Colab")
     
     # Hiển thị thông tin cấu hình
