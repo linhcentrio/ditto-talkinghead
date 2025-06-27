@@ -323,12 +323,16 @@ class DittoSimpleSetup:
         except:
             return False
             
-        # Thiết lập optional keys
+        # Thiết lập optional keys và thông báo
         if openai_key:
             os.environ['OPENAI_API_KEY'] = openai_key
+            print("   ✅ OpenAI API Key được thiết lập từ Notebook")
+        else:
+            print("   ℹ️ OpenAI API Key không có - có thể nhập trong tab Cài đặt")
             
         if pexels_key:
             os.environ['PEXELS_API_KEY'] = pexels_key
+            print("   ✅ Pexels API Key được thiết lập từ Notebook")
             
         return True
     

@@ -129,6 +129,9 @@ VOICE_DESCRIPTIONS = {
 # === Khởi tạo session state ===
 def init_session_state():
     """Khởi tạo toàn bộ session state cần thiết"""
+    # Lấy API key từ environment variable trước (từ notebook setup)
+    env_openai_key = os.environ.get('OPENAI_API_KEY', '').strip()
+    
     defaults = {
         'processing': False,
         'complete': False,
@@ -141,13 +144,20 @@ def init_session_state():
         'cancel_event': None,
         'msg_queue': None,
         'tts_instructions_preset': "Tone: Tự nhiên, trôi chảy, chuyên nghiệp\nEmotion: Nhiệt tình, tự tin\nDelivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan trọng",
-        'openai_api_key': '',
-        'openai_api_status': 'not_tested',  # not_tested, testing, valid, invalid
+        'openai_api_key': env_openai_key,  # Ưu tiên environment variable
+        'openai_api_status': 'valid' if env_openai_key else 'not_tested',  # Assume valid if from env
+        'api_key_source': 'environment' if env_openai_key else 'manual',  # Track source
     }
     
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    
+    # Nếu có API key từ environment và chưa khởi tạo client
+    if env_openai_key and not st.session_state.openai_api_key:
+        st.session_state.openai_api_key = env_openai_key
+        st.session_state.openai_api_status = 'valid'
+        st.session_state.api_key_source = 'environment'
 
 # === Hàm xác thực tham số khẩu hình ===
 def validate_mouth_params(vad_alpha=1.0, exp_components=None, exp_scale=1.0, pose_scale=1.0, delta_exp_enabled=False, delta_exp_value=0.0):
@@ -2085,71 +2095,103 @@ def main():
             3. Copy và paste vào ô bên dưới
             """)
             
-            # API Key input
+            # Hiển thị thông tin nguồn API key
+            if st.session_state.get('api_key_source') == 'environment':
+                st.info("ℹ️ **API Key được tự động tải từ cấu hình Notebook** - Không cần nhập lại!")
+            
+            # API Key input - disable nếu đã có từ environment
             api_key_input = st.text_input(
                 "OpenAI API Key:",
-                value=st.session_state.openai_api_key,
+                value=st.session_state.openai_api_key if st.session_state.get('api_key_source') != 'environment' else "••••••••••••••••••••••••••••••••••••••••••••••••••••",
                 type="password",
-                placeholder="sk-proj-...",
-                help="Nhập OpenAI API key để sử dụng GPT-4o-mini-TTS và OpenAI TTS"
+                placeholder="sk-proj-..." if st.session_state.get('api_key_source') != 'environment' else "Đã cấu hình từ Notebook",
+                help="API key được tự động tải từ cell cấu hình trong Notebook" if st.session_state.get('api_key_source') == 'environment' else "Nhập OpenAI API key để sử dụng GPT-4o-mini-TTS và OpenAI TTS",
+                disabled=st.session_state.get('api_key_source') == 'environment'
             )
             
-            # Buttons row
-            col1, col2, col3 = st.columns([1, 1, 2])
-            
-            with col1:
-                save_button = st.button("💾 Lưu", use_container_width=True)
-            
-            with col2:
-                test_button = st.button("🧪 Kiểm tra", use_container_width=True, disabled=not api_key_input.strip())
-            
-            with col3:
-                clear_button = st.button("🗑️ Xóa", use_container_width=True)
-            
-            # Handle buttons
-            if save_button and api_key_input.strip():
-                st.session_state.openai_api_key = api_key_input.strip()
-                st.session_state.openai_api_status = 'not_tested'
-                initialize_openai_client()
-                st.success("✅ Đã lưu OpenAI API key!")
-                st.rerun()
-            
-            if test_button and api_key_input.strip():
-                st.session_state.openai_api_status = 'testing'
-                with st.spinner("🧪 Đang kiểm tra API key..."):
-                    try:
-                        is_valid, message = asyncio.run(test_openai_api_key(api_key_input.strip()))
-                        if is_valid:
-                            st.session_state.openai_api_status = 'valid'
-                            st.success(f"✅ {message}")
-                            st.session_state.openai_api_key = api_key_input.strip()
-                            initialize_openai_client()
-                        else:
+            # Buttons row - chỉ hiển thị khi không phải từ environment
+            if st.session_state.get('api_key_source') != 'environment':
+                col1, col2, col3 = st.columns([1, 1, 2])
+                
+                with col1:
+                    save_button = st.button("💾 Lưu", use_container_width=True)
+                
+                with col2:
+                    test_button = st.button("🧪 Kiểm tra", use_container_width=True, disabled=not (api_key_input and api_key_input.strip()))
+                
+                with col3:
+                    clear_button = st.button("🗑️ Xóa", use_container_width=True)
+                
+                # Handle buttons
+                if save_button and api_key_input and api_key_input.strip():
+                    st.session_state.openai_api_key = api_key_input.strip()
+                    st.session_state.openai_api_status = 'not_tested'
+                    st.session_state.api_key_source = 'manual'
+                    initialize_openai_client()
+                    st.success("✅ Đã lưu OpenAI API key!")
+                    st.rerun()
+                
+                if test_button and api_key_input and api_key_input.strip():
+                    st.session_state.openai_api_status = 'testing'
+                    with st.spinner("🧪 Đang kiểm tra API key..."):
+                        try:
+                            is_valid, message = asyncio.run(test_openai_api_key(api_key_input.strip()))
+                            if is_valid:
+                                st.session_state.openai_api_status = 'valid'
+                                st.success(f"✅ {message}")
+                                st.session_state.openai_api_key = api_key_input.strip()
+                                st.session_state.api_key_source = 'manual'
+                                initialize_openai_client()
+                            else:
+                                st.session_state.openai_api_status = 'invalid'
+                                st.error(f"❌ {message}")
+                        except Exception as e:
                             st.session_state.openai_api_status = 'invalid'
-                            st.error(f"❌ {message}")
-                    except Exception as e:
-                        st.session_state.openai_api_status = 'invalid'
-                        st.error(f"❌ Lỗi kiểm tra: {str(e)}")
-                st.rerun()
-            
-            if clear_button:
-                st.session_state.openai_api_key = ''
-                st.session_state.openai_api_status = 'not_tested'
-                initialize_openai_client()
-                st.info("🗑️ Đã xóa API key")
-                st.rerun()
+                            st.error(f"❌ Lỗi kiểm tra: {str(e)}")
+                    st.rerun()
+                
+                if clear_button:
+                    st.session_state.openai_api_key = ''
+                    st.session_state.openai_api_status = 'not_tested'
+                    st.session_state.api_key_source = 'manual'
+                    initialize_openai_client()
+                    st.info("🗑️ Đã xóa API key")
+                    st.rerun()
+            else:
+                # Chỉ hiển thị nút test connection cho API key từ environment
+                if st.button("🔗 Test kết nối với API key từ Notebook", use_container_width=True):
+                    with st.spinner("🧪 Đang kiểm tra API key từ Notebook..."):
+                        try:
+                            is_valid, message = asyncio.run(test_openai_api_key(st.session_state.openai_api_key))
+                            if is_valid:
+                                st.session_state.openai_api_status = 'valid'
+                                st.success(f"✅ {message}")
+                                initialize_openai_client()
+                            else:
+                                st.session_state.openai_api_status = 'invalid'
+                                st.error(f"❌ {message}")
+                        except Exception as e:
+                            st.session_state.openai_api_status = 'invalid'
+                            st.error(f"❌ Lỗi kiểm tra: {str(e)}")
+                    st.rerun()
             
             # Status indicator
             if st.session_state.openai_api_key:
                 status = st.session_state.openai_api_status
+                api_source = st.session_state.get('api_key_source', 'manual')
+                
                 if status == 'valid':
-                    st.success("✅ API key đã được xác thực và đang hoạt động")
+                    source_text = "từ Notebook" if api_source == 'environment' else "thủ công"
+                    st.success(f"✅ API key đã được xác thực và đang hoạt động (nguồn: {source_text})")
                 elif status == 'invalid':
                     st.error("❌ API key không hợp lệ hoặc có lỗi")
                 elif status == 'testing':
                     st.info("🧪 Đang kiểm tra API key...")
                 else:
-                    st.warning("⚠️ API key chưa được kiểm tra. Nhấn 'Kiểm tra' để xác thực.")
+                    if api_source == 'environment':
+                        st.info("ℹ️ API key từ Notebook - Nhấn 'Test kết nối' để xác thực.")
+                    else:
+                        st.warning("⚠️ API key chưa được kiểm tra. Nhấn 'Kiểm tra' để xác thực.")
             else:
                 st.info("ℹ️ Chưa có API key. Một số tính năng sẽ không khả dụng.")
         
