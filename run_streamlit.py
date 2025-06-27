@@ -37,13 +37,50 @@ except ImportError:
     st.error("❌ Không thể import VideoEditor. Vui lòng kiểm tra file video_editor.py")
     st.stop()
 
-# OpenAI client
+# OpenAI client - sẽ được khởi tạo sau khi có API key
 try:
     from openai import AsyncOpenAI
-    openai_client = AsyncOpenAI()
+    OPENAI_AVAILABLE = True
 except ImportError:
     st.warning("⚠️ OpenAI client không khả dụng")
-    openai_client = None
+    OPENAI_AVAILABLE = False
+    
+openai_client = None
+
+# === Khởi tạo OpenAI Client ===
+def initialize_openai_client():
+    """Khởi tạo OpenAI client với API key từ session state"""
+    global openai_client
+    if OPENAI_AVAILABLE and st.session_state.openai_api_key.strip():
+        try:
+            openai_client = AsyncOpenAI(api_key=st.session_state.openai_api_key.strip())
+            return True
+        except Exception as e:
+            st.error(f"Lỗi khởi tạo OpenAI client: {str(e)}")
+            openai_client = None
+            return False
+    else:
+        openai_client = None
+        return False
+
+# === Kiểm tra API Key ===
+async def test_openai_api_key(api_key: str) -> Tuple[bool, str]:
+    """Kiểm tra tính hợp lệ của OpenAI API key"""
+    try:
+        test_client = AsyncOpenAI(api_key=api_key.strip())
+        # Test với một request đơn giản
+        response = await test_client.models.list()
+        return True, "API key hợp lệ"
+    except Exception as e:
+        error_msg = str(e)
+        if "invalid_api_key" in error_msg:
+            return False, "API key không hợp lệ"
+        elif "rate_limit" in error_msg:
+            return False, "Đã vượt quá giới hạn rate limit"
+        elif "insufficient_quota" in error_msg:
+            return False, "Tài khoản không đủ quota"
+        else:
+            return False, f"Lỗi kết nối: {error_msg}"
 
 # === Cấu hình Google Colab ===
 def get_colab_config():
@@ -103,6 +140,9 @@ def init_session_state():
         'workflow_steps': {k: True for k in WORKFLOW_STEPS},
         'cancel_event': None,
         'msg_queue': None,
+        'tts_instructions_preset': "Tone: Tự nhiên, trôi chảy, chuyên nghiệp\nEmotion: Nhiệt tình, tự tin\nDelivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan trọng",
+        'openai_api_key': '',
+        'openai_api_status': 'not_tested',  # not_tested, testing, valid, invalid
     }
     
     for key, value in defaults.items():
@@ -226,6 +266,10 @@ def update_history_from_folder():
 async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voice: str = "shimmer") -> bool:
     """Tạo audio từ văn bản bằng GPT-4o-mini-TTS với hướng dẫn về giọng điệu"""
     try:
+        # Kiểm tra openai_client có sẵn
+        if not openai_client:
+            raise Exception("OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
+        
         # Tạo file PCM tạm
         temp_pcm = output_path + ".pcm"
         
@@ -234,7 +278,6 @@ async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voi
             model="gpt-4o-mini-tts",
             voice=voice.lower(),
             input=text,
-            instructions=instructions,
             response_format="pcm",
         ) as response:
             # Lưu nội dung PCM vào file
@@ -262,6 +305,10 @@ async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voi
 async def preview_audio_tts(text, instructions, voice, message_placeholder=None):
     """Tạo và phát mẫu giọng nói từ GPT-4o-mini-TTS"""
     try:
+        # Kiểm tra openai_client có sẵn
+        if not openai_client:
+            raise Exception("OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
+        
         if message_placeholder:
             message_placeholder.write("⏳ Đang tạo mẫu giọng nói...")
         
@@ -274,7 +321,6 @@ async def preview_audio_tts(text, instructions, voice, message_placeholder=None)
             model="gpt-4o-mini-tts",
             voice=voice.lower(),
             input=text,
-            instructions=instructions,
             response_format="pcm",
         ) as response:
             # Lưu nội dung PCM vào file
@@ -917,7 +963,7 @@ def main():
             """)
     
     # === Tabs chính ===
-    tabs = st.tabs(["🎬 Tạo Video MC", "🎭 Video Khuôn Mặt AI", "🎙️ Text-to-Speech", "📋 Lịch Sử", "❓ Hướng Dẫn"])
+    tabs = st.tabs(["🎬 Tạo Video MC", "🎭 Video Khuôn Mặt AI", "🎙️ Text-to-Speech", "📋 Lịch Sử", "⚙️ Cài Đặt", "❓ Hướng Dẫn"])
     
     # === Tab 0: Tạo Video MC ===
     with tabs[0]:
@@ -1733,13 +1779,21 @@ def main():
                 
                 tts_speed_standalone = 1.2  # Fixed for GPT-4o
                 
+                # Khởi tạo giá trị preset nếu chưa có
+                if 'tts_instructions_preset' not in st.session_state:
+                    st.session_state.tts_instructions_preset = "Tone: Tự nhiên, trôi chảy, chuyên nghiệp\nEmotion: Nhiệt tình, tự tin\nDelivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan trọng"
+                
                 tts_instructions_standalone = st.text_area(
                     "🎭 Hướng dẫn về giọng điệu:",
-                    value="Tone: Tự nhiên, trôi chảy, chuyên nghiệp\nEmotion: Nhiệt tình, tự tin\nDelivery: Rõ ràng, nhịp độ vừa phải, nhấn mạnh từ khóa quan trọng",
+                    value=st.session_state.tts_instructions_preset,
                     height=120,
                     key="tts_instructions_standalone",
                     help="Mô tả tông giọng, cảm xúc và cách truyền đạt mong muốn"
                 )
+                
+                # Cập nhật preset khi người dùng thay đổi
+                if tts_instructions_standalone != st.session_state.tts_instructions_preset:
+                    st.session_state.tts_instructions_preset = tts_instructions_standalone
                 
                 # Instruction templates
                 with st.expander("📋 Mẫu hướng dẫn giọng điệu", expanded=False):
@@ -1748,23 +1802,23 @@ def main():
                     with col1:
                         st.markdown("**🎤 Giọng diễn thuyết:**")
                         if st.button("Sử dụng", key="preset_speech"):
-                            st.session_state.tts_instructions_standalone = "Tone: Đĩnh đạc, trang trọng, đầy tự tin\nEmotion: Nhiệt huyết, quyết đoán\nDelivery: Nhịp độ vừa phải với các ngắt quãng, nhấn mạnh từ khóa quan trọng"
+                            st.session_state.tts_instructions_preset = "Tone: Đĩnh đạc, trang trọng, đầy tự tin\nEmotion: Nhiệt huyết, quyết đoán\nDelivery: Nhịp độ vừa phải với các ngắt quãng, nhấn mạnh từ khóa quan trọng"
                             st.rerun()
                         
                         st.markdown("**💼 Giọng thuyết trình:**")
                         if st.button("Sử dụng", key="preset_presentation"):
-                            st.session_state.tts_instructions_standalone = "Tone: Chuyên nghiệp, rõ ràng, tự tin\nEmotion: Tập trung, nghiêm túc\nDelivery: Nhịp độ đều đặn, phát âm rõ ràng từng từ"
+                            st.session_state.tts_instructions_preset = "Tone: Chuyên nghiệp, rõ ràng, tự tin\nEmotion: Tập trung, nghiêm túc\nDelivery: Nhịp độ đều đặn, phát âm rõ ràng từng từ"
                             st.rerun()
                     
                     with col2:
                         st.markdown("**🤝 Giọng tư vấn:**")
                         if st.button("Sử dụng", key="preset_consulting"):
-                            st.session_state.tts_instructions_standalone = "Tone: Ấm áp, thân thiện, đáng tin cậy\nEmotion: Thấu hiểu, quan tâm\nDelivery: Nhẹ nhàng, rõ ràng, tạo cảm giác an tâm"
+                            st.session_state.tts_instructions_preset = "Tone: Ấm áp, thân thiện, đáng tin cậy\nEmotion: Thấu hiểu, quan tâm\nDelivery: Nhẹ nhàng, rõ ràng, tạo cảm giác an tâm"
                             st.rerun()
                         
                         st.markdown("**📺 Giọng quảng cáo:**")
                         if st.button("Sử dụng", key="preset_ads"):
-                            st.session_state.tts_instructions_standalone = "Tone: Sôi nổi, cuốn hút, năng động\nEmotion: Phấn khích, hào hứng\nDelivery: Nhanh, đầy năng lượng, với cường độ tăng dần"
+                            st.session_state.tts_instructions_preset = "Tone: Sôi nổi, cuốn hút, năng động\nEmotion: Phấn khích, hào hứng\nDelivery: Nhanh, đầy năng lượng, với cường độ tăng dần"
                             st.rerun()
             
             # Action buttons
@@ -2010,8 +2064,140 @@ def main():
                                 except Exception as e:
                                     st.error(f"Không thể xóa file: {str(e)}")
     
-    # === Tab 4: Hướng dẫn ===
+    # === Tab 4: Cài đặt ===
     with tabs[4]:
+        st.subheader("⚙️ Cài đặt API Keys")
+        st.write("Cấu hình các API keys cần thiết cho các tính năng nâng cao")
+        
+        # Khởi tạo OpenAI client nếu chưa có
+        initialize_openai_client()
+        
+        # OpenAI API Key Section
+        with st.expander("🤖 OpenAI API Key", expanded=True):
+            st.markdown("""
+            **OpenAI API Key** được sử dụng cho:
+            - 🎭 GPT-4o-mini-TTS (Text-to-Speech chất lượng cao)
+            - 🎤 OpenAI TTS (Text-to-Speech chuyên nghiệp)
+            
+            💡 **Cách lấy API Key:**
+            1. Truy cập [OpenAI Platform](https://platform.openai.com/account/api-keys)
+            2. Đăng nhập và tạo API key mới
+            3. Copy và paste vào ô bên dưới
+            """)
+            
+            # API Key input
+            api_key_input = st.text_input(
+                "OpenAI API Key:",
+                value=st.session_state.openai_api_key,
+                type="password",
+                placeholder="sk-proj-...",
+                help="Nhập OpenAI API key để sử dụng GPT-4o-mini-TTS và OpenAI TTS"
+            )
+            
+            # Buttons row
+            col1, col2, col3 = st.columns([1, 1, 2])
+            
+            with col1:
+                save_button = st.button("💾 Lưu", use_container_width=True)
+            
+            with col2:
+                test_button = st.button("🧪 Kiểm tra", use_container_width=True, disabled=not api_key_input.strip())
+            
+            with col3:
+                clear_button = st.button("🗑️ Xóa", use_container_width=True)
+            
+            # Handle buttons
+            if save_button and api_key_input.strip():
+                st.session_state.openai_api_key = api_key_input.strip()
+                st.session_state.openai_api_status = 'not_tested'
+                initialize_openai_client()
+                st.success("✅ Đã lưu OpenAI API key!")
+                st.rerun()
+            
+            if test_button and api_key_input.strip():
+                st.session_state.openai_api_status = 'testing'
+                with st.spinner("🧪 Đang kiểm tra API key..."):
+                    try:
+                        is_valid, message = asyncio.run(test_openai_api_key(api_key_input.strip()))
+                        if is_valid:
+                            st.session_state.openai_api_status = 'valid'
+                            st.success(f"✅ {message}")
+                            st.session_state.openai_api_key = api_key_input.strip()
+                            initialize_openai_client()
+                        else:
+                            st.session_state.openai_api_status = 'invalid'
+                            st.error(f"❌ {message}")
+                    except Exception as e:
+                        st.session_state.openai_api_status = 'invalid'
+                        st.error(f"❌ Lỗi kiểm tra: {str(e)}")
+                st.rerun()
+            
+            if clear_button:
+                st.session_state.openai_api_key = ''
+                st.session_state.openai_api_status = 'not_tested'
+                initialize_openai_client()
+                st.info("🗑️ Đã xóa API key")
+                st.rerun()
+            
+            # Status indicator
+            if st.session_state.openai_api_key:
+                status = st.session_state.openai_api_status
+                if status == 'valid':
+                    st.success("✅ API key đã được xác thực và đang hoạt động")
+                elif status == 'invalid':
+                    st.error("❌ API key không hợp lệ hoặc có lỗi")
+                elif status == 'testing':
+                    st.info("🧪 Đang kiểm tra API key...")
+                else:
+                    st.warning("⚠️ API key chưa được kiểm tra. Nhấn 'Kiểm tra' để xác thực.")
+            else:
+                st.info("ℹ️ Chưa có API key. Một số tính năng sẽ không khả dụng.")
+        
+        # Thông tin API Usage
+        if openai_client:
+            with st.expander("📊 Thông tin sử dụng API", expanded=False):
+                st.markdown("""
+                **Lưu ý về chi phí:**
+                - GPT-4o-mini-TTS: ~$0.150 / 1M ký tự
+                - OpenAI TTS: ~$15.00 / 1M ký tự
+                - Một đoạn văn 1000 từ ≈ 5000 ký tự
+                
+                **Khuyến nghị:**
+                - Sử dụng Edge TTS (miễn phí) cho mục đích thử nghiệm
+                - GPT-4o-mini-TTS cho chất lượng cao với chi phí hợp lý
+                - OpenAI TTS cho chất lượng premium
+                """)
+                
+                # Test connection button
+                if st.button("🔗 Test kết nối", key="test_connection"):
+                    with st.spinner("Đang test kết nối..."):
+                        try:
+                            is_valid, message = asyncio.run(test_openai_api_key(st.session_state.openai_api_key))
+                            if is_valid:
+                                st.success(f"✅ {message}")
+                            else:
+                                st.error(f"❌ {message}")
+                        except Exception as e:
+                            st.error(f"❌ Lỗi: {str(e)}")
+        
+        # API Keys Security
+        with st.expander("🔒 Bảo mật API Keys", expanded=False):
+            st.markdown("""
+            **⚠️ Lưu ý bảo mật quan trọng:**
+            
+            1. **Không chia sẻ API keys** với người khác
+            2. **Xóa API keys** khi không sử dụng nữa
+            3. **Giám sát usage** thường xuyên trên OpenAI Platform
+            4. **Đặt limits** cho API usage để tránh chi phí bất ngờ
+            
+            **🛡️ API keys được lưu trong:**
+            - Session memory của Streamlit (tạm thời)
+            - Không được lưu vào file hoặc database
+            - Sẽ bị xóa khi tắt ứng dụng
+            """)
+    
+    # === Tab 5: Hướng dẫn ===
+    with tabs[5]:
         st.subheader("❓ Hướng dẫn sử dụng")
         
         with st.expander("🚀 Bắt đầu nhanh", expanded=True):
