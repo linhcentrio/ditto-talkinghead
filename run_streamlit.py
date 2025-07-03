@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Streamlit UI tối ưu cho Google Colab - AI Video Creator
-Bao gồm tất cả tính năng nâng cao trừ subtitle
+Bao gồm tất cả tính năng nâng cao với OpenAI client được cải tiến
 """
 
 import streamlit as st
@@ -51,9 +51,12 @@ openai_client = None
 def initialize_openai_client():
     """Khởi tạo OpenAI client với API key từ session state"""
     global openai_client
-    if OPENAI_AVAILABLE and st.session_state.openai_api_key.strip():
+    if OPENAI_AVAILABLE and st.session_state.get('openai_api_key', '').strip():
         try:
-            openai_client = AsyncOpenAI(api_key=st.session_state.openai_api_key.strip())
+            api_key = st.session_state.openai_api_key.strip()
+            openai_client = AsyncOpenAI(api_key=api_key)
+            # Debug log
+            print(f"✅ OpenAI client initialized successfully with key: {api_key[:10]}...")
             return True
         except Exception as e:
             st.error(f"Lỗi khởi tạo OpenAI client: {str(e)}")
@@ -62,6 +65,13 @@ def initialize_openai_client():
     else:
         openai_client = None
         return False
+
+def ensure_openai_client():
+    """Đảm bảo OpenAI client được khởi tạo"""
+    global openai_client
+    if not openai_client and st.session_state.get('openai_api_key', '').strip():
+        return initialize_openai_client()
+    return bool(openai_client)
 
 # === Kiểm tra API Key ===
 async def test_openai_api_key(api_key: str) -> Tuple[bool, str]:
@@ -147,6 +157,7 @@ def init_session_state():
         'openai_api_key': env_openai_key,  # Ưu tiên environment variable
         'openai_api_status': 'valid' if env_openai_key else 'not_tested',  # Assume valid if from env
         'api_key_source': 'environment' if env_openai_key else 'manual',  # Track source
+        'client_initialized': False,
     }
     
     for key, value in defaults.items():
@@ -154,10 +165,13 @@ def init_session_state():
             st.session_state[key] = value
     
     # Nếu có API key từ environment và chưa khởi tạo client
-    if env_openai_key and not st.session_state.openai_api_key:
+    if env_openai_key and not st.session_state.get('client_initialized', False):
         st.session_state.openai_api_key = env_openai_key
         st.session_state.openai_api_status = 'valid'
         st.session_state.api_key_source = 'environment'
+        # Khởi tạo client ngay lập tức
+        if initialize_openai_client():
+            st.session_state.client_initialized = True
 
 # === Hàm xác thực tham số khẩu hình ===
 def validate_mouth_params(vad_alpha=1.0, exp_components=None, exp_scale=1.0, pose_scale=1.0, delta_exp_enabled=False, delta_exp_value=0.0):
@@ -276,9 +290,11 @@ def update_history_from_folder():
 async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voice: str = "shimmer") -> bool:
     """Tạo audio từ văn bản bằng GPT-4o-mini-TTS với hướng dẫn về giọng điệu"""
     try:
-        # Kiểm tra openai_client có sẵn
+        # Đảm bảo OpenAI client được khởi tạo
+        global openai_client
         if not openai_client:
-            raise Exception("OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
+            if not ensure_openai_client():
+                raise Exception("OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
         
         # Tạo file PCM tạm
         temp_pcm = output_path + ".pcm"
@@ -315,9 +331,11 @@ async def generate_gpt4o_tts(text: str, output_path: str, instructions: str, voi
 async def preview_audio_tts(text, instructions, voice, message_placeholder=None):
     """Tạo và phát mẫu giọng nói từ GPT-4o-mini-TTS"""
     try:
-        # Kiểm tra openai_client có sẵn
+        # Đảm bảo OpenAI client được khởi tạo
+        global openai_client
         if not openai_client:
-            raise Exception("OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
+            if not ensure_openai_client():
+                raise Exception("OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
         
         if message_placeholder:
             message_placeholder.write("⏳ Đang tạo mẫu giọng nói...")
@@ -910,6 +928,10 @@ def main():
     # Khởi tạo session state
     init_session_state()
     
+    # Auto-initialize OpenAI client nếu có API key
+    if not openai_client and st.session_state.get('openai_api_key'):
+        ensure_openai_client()
+    
     # Lấy cấu hình
     config = get_colab_config()
     
@@ -956,6 +978,22 @@ def main():
         
         # Show logs
         show_logs = st.checkbox("Hiển thị logs chi tiết", value=False)
+        
+        # Debug OpenAI client
+        st.subheader("🔍 Debug OpenAI")
+        if st.button("🔄 Kiểm tra OpenAI Client"):
+            st.write(f"**API Key có sẵn:** {bool(st.session_state.get('openai_api_key'))}")
+            st.write(f"**Client đã khởi tạo:** {bool(openai_client)}")
+            st.write(f"**OPENAI_AVAILABLE:** {OPENAI_AVAILABLE}")
+            if st.session_state.get('openai_api_key'):
+                st.write(f"**API Key length:** {len(st.session_state.openai_api_key)}")
+                st.write(f"**API Key starts with:** {st.session_state.openai_api_key[:10]}...")
+                if st.button("🔄 Thử khởi tạo lại"):
+                    result = ensure_openai_client()
+                    if result:
+                        st.success("✅ OpenAI client khởi tạo thành công!")
+                    else:
+                        st.error("❌ Không thể khởi tạo OpenAI client")
         
         st.divider()
         
@@ -1831,6 +1869,19 @@ def main():
                             st.session_state.tts_instructions_preset = "Tone: Sôi nổi, cuốn hút, năng động\nEmotion: Phấn khích, hào hứng\nDelivery: Nhanh, đầy năng lượng, với cường độ tăng dần"
                             st.rerun()
             
+            # Debug OpenAI client cho TTS
+            if tts_service_standalone == "GPT-4o-mini-TTS":
+                with st.expander("🔍 Debug OpenAI TTS", expanded=False):
+                    st.write(f"**OpenAI API Key có sẵn:** {bool(st.session_state.get('openai_api_key'))}")
+                    st.write(f"**OpenAI Client đã khởi tạo:** {bool(openai_client)}")
+                    st.write(f"**OPENAI_AVAILABLE:** {OPENAI_AVAILABLE}")
+                    if st.button("🔄 Thử khởi tạo lại OpenAI client", key="debug_reinit_client"):
+                        result = ensure_openai_client()
+                        if result:
+                            st.success("✅ OpenAI client đã được khởi tạo thành công!")
+                        else:
+                            st.error("❌ Không thể khởi tạo OpenAI client")
+            
             # Action buttons
             col_preview, col_download = st.columns(2)
             
@@ -1860,21 +1911,28 @@ def main():
             if preview_button and tts_text.strip():
                 preview_message.info("⏳ Đang tạo mẫu giọng nói...")
                 
-                if tts_service_standalone == "GPT-4o-mini-TTS" and openai_client:
-                    try:
-                        # Use asyncio for GPT-4o preview
-                        audio_bytes = asyncio.run(preview_audio_tts(
-                            tts_text[:200],  # Limit preview length
-                            tts_instructions_standalone,
-                            tts_voice_standalone,
-                            preview_message
-                        ))
-                        
-                        if audio_bytes:
-                            preview_message.success("✅ Tạo mẫu giọng nói thành công!")
-                            preview_audio.audio(audio_bytes, format="audio/mp3")
-                    except Exception as e:
-                        preview_message.error(f"Lỗi: {str(e)}")
+                if tts_service_standalone == "GPT-4o-mini-TTS":
+                    # Đảm bảo OpenAI client được khởi tạo
+                    if not openai_client:
+                        ensure_openai_client()
+                    
+                    if openai_client:
+                        try:
+                            # Use asyncio for GPT-4o preview
+                            audio_bytes = asyncio.run(preview_audio_tts(
+                                tts_text[:200],  # Limit preview length
+                                tts_instructions_standalone,
+                                tts_voice_standalone,
+                                preview_message
+                            ))
+                            
+                            if audio_bytes:
+                                preview_message.success("✅ Tạo mẫu giọng nói thành công!")
+                                preview_audio.audio(audio_bytes, format="audio/mp3")
+                        except Exception as e:
+                            preview_message.error(f"Lỗi: {str(e)}")
+                    else:
+                        preview_message.error("❌ OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
                         
                 else:
                     try:
@@ -1909,34 +1967,41 @@ def main():
                     try:
                         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                         
-                        if tts_service_standalone == "GPT-4o-mini-TTS" and openai_client:
-                            # Generate with GPT-4o-mini-TTS
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
-                                temp_path = temp.name
+                        if tts_service_standalone == "GPT-4o-mini-TTS":
+                            # Đảm bảo OpenAI client được khởi tạo
+                            if not openai_client:
+                                ensure_openai_client()
                             
-                            success = asyncio.run(generate_gpt4o_tts(
-                                tts_text,
-                                temp_path,
-                                tts_instructions_standalone,
-                                tts_voice_standalone
-                            ))
-                            
-                            if success and os.path.exists(temp_path):
-                                with open(temp_path, "rb") as f:
-                                    audio_bytes = f.read()
+                            if openai_client:
+                                # Generate with GPT-4o-mini-TTS
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp:
+                                    temp_path = temp.name
                                 
-                                st.download_button(
-                                    "💾 Tải xuống audio",
-                                    audio_bytes,
-                                    file_name=f"tts_gpt4o_{timestamp}.mp3",
-                                    mime="audio/mp3",
-                                    use_container_width=True
-                                )
+                                success = asyncio.run(generate_gpt4o_tts(
+                                    tts_text,
+                                    temp_path,
+                                    tts_instructions_standalone,
+                                    tts_voice_standalone
+                                ))
                                 
-                                st.audio(audio_bytes, format="audio/mp3")
-                                os.unlink(temp_path)
+                                if success and os.path.exists(temp_path):
+                                    with open(temp_path, "rb") as f:
+                                        audio_bytes = f.read()
+                                    
+                                    st.download_button(
+                                        "💾 Tải xuống audio",
+                                        audio_bytes,
+                                        file_name=f"tts_gpt4o_{timestamp}.mp3",
+                                        mime="audio/mp3",
+                                        use_container_width=True
+                                    )
+                                    
+                                    st.audio(audio_bytes, format="audio/mp3")
+                                    os.unlink(temp_path)
+                                else:
+                                    st.error("Lỗi khi tạo audio với GPT-4o-mini-TTS")
                             else:
-                                st.error("Lỗi khi tạo audio với GPT-4o-mini-TTS")
+                                st.error("❌ OpenAI client chưa được khởi tạo. Vui lòng kiểm tra API key trong tab Cài đặt.")
                                 
                         else:
                             # Generate with other services
@@ -2079,9 +2144,6 @@ def main():
         st.subheader("⚙️ Cài đặt API Keys")
         st.write("Cấu hình các API keys cần thiết cho các tính năng nâng cao")
         
-        # Khởi tạo OpenAI client nếu chưa có
-        initialize_openai_client()
-        
         # OpenAI API Key Section
         with st.expander("🤖 OpenAI API Key", expanded=True):
             st.markdown("""
@@ -2127,7 +2189,8 @@ def main():
                     st.session_state.openai_api_key = api_key_input.strip()
                     st.session_state.openai_api_status = 'not_tested'
                     st.session_state.api_key_source = 'manual'
-                    initialize_openai_client()
+                    st.session_state.client_initialized = False
+                    ensure_openai_client()
                     st.success("✅ Đã lưu OpenAI API key!")
                     st.rerun()
                 
@@ -2137,24 +2200,24 @@ def main():
                         try:
                             is_valid, message = asyncio.run(test_openai_api_key(api_key_input.strip()))
                             if is_valid:
-                                st.session_state.openai_api_status = 'valid'
-                                st.success(f"✅ {message}")
-                                st.session_state.openai_api_key = api_key_input.strip()
-                                st.session_state.api_key_source = 'manual'
-                                initialize_openai_client()
+                                 st.session_state.openai_api_status = 'valid'
+                                 st.success(f"✅ {message}")
+                                 st.session_state.openai_api_key = api_key_input.strip()
+                                 st.session_state.api_key_source = 'manual'
+                                 ensure_openai_client()
                             else:
-                                st.session_state.openai_api_status = 'invalid'
-                                st.error(f"❌ {message}")
+                                 st.session_state.openai_api_status = 'invalid'
+                                 st.error(f"❌ {message}")
                         except Exception as e:
-                            st.session_state.openai_api_status = 'invalid'
-                            st.error(f"❌ Lỗi kiểm tra: {str(e)}")
+                             st.session_state.openai_api_status = 'invalid'
+                             st.error(f"❌ Lỗi kiểm tra: {str(e)}")
                     st.rerun()
                 
                 if clear_button:
                     st.session_state.openai_api_key = ''
                     st.session_state.openai_api_status = 'not_tested'
                     st.session_state.api_key_source = 'manual'
-                    initialize_openai_client()
+                    ensure_openai_client()
                     st.info("🗑️ Đã xóa API key")
                     st.rerun()
             else:
@@ -2166,7 +2229,7 @@ def main():
                             if is_valid:
                                 st.session_state.openai_api_status = 'valid'
                                 st.success(f"✅ {message}")
-                                initialize_openai_client()
+                                ensure_openai_client()
                             else:
                                 st.session_state.openai_api_status = 'invalid'
                                 st.error(f"❌ {message}")
